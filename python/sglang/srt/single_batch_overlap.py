@@ -75,11 +75,18 @@ def execute_sbo(
     topk_output: TopKOutput,
     alt_stream: Optional[torch.cuda.Stream] = None,
     disable_sbo: bool = False,
+    forward_batch=None,
 ):
-
-    dispatch_output = experts.dispatcher.dispatch(
-        hidden_states=hidden_states, topk_output=topk_output
-    )
+    if forward_batch.forward_mode.is_extend() or forward_batch.is_extend_in_batch:
+        dispatch_output = experts.all2all_v.token_dispatch(
+            hidden_states=hidden_states,
+            topk_weights=topk_output.topk_weights,
+            topk_ids=topk_output.topk_ids,
+        )
+    else:
+        dispatch_output = experts.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
 
     combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
         _compute_overlap_args(dispatch_output, alt_stream, disable_sbo=disable_sbo)
@@ -97,11 +104,14 @@ def execute_sbo(
             meta_overlap_args["compute_num_sms"]
         ):
             forward_shared_experts()
-
-    hidden_states = experts.dispatcher.combine(
-        combine_input=combine_input,
-        overlap_args=combine_overlap_args,
-    )
+    if forward_batch.forward_mode.is_extend() or forward_batch.is_extend_in_batch:
+        hidden_states = experts.all2all_v.token_combine(hidden_states=hidden_states)
+    else:
+        #todo-luo 参数不一样，暂未修改
+        hidden_states = experts.dispatcher.combine(
+            combine_input=combine_input,
+            overlap_args=combine_overlap_args,
+        )
 
     return hidden_states
 

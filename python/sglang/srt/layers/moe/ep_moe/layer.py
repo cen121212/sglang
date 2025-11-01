@@ -156,6 +156,7 @@ class DeepEPMoE(FusedMoE):
         forward_shared_experts=None,
         alt_stream=None,
         disable_sbo=False,
+        forward_batch=None
     ):
 
         if self.deprecate_flag:
@@ -175,6 +176,7 @@ class DeepEPMoE(FusedMoE):
             forward_shared_experts=forward_shared_experts,
             alt_stream=alt_stream,
             disable_sbo=disable_sbo,
+            forward_batch=forward_batch,
         )
 
     def dispatch(

@@ -718,6 +718,7 @@ class DeepseekV2MoE(nn.Module):
                     should_allreduce_fusion,
                     use_reduce_scatter,
                     gemm_output_zero_allocator,
+                    forward_batch,
                 )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -770,6 +771,7 @@ class DeepseekV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
+        forward_batch=None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -800,6 +802,7 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = self.experts(
             hidden_states,
             topk_output,
+            forward_batch=forward_batch,
             **(
                 dict(
                     forward_shared_experts=_forward_shared_experts_and_put_results,
@@ -915,6 +918,7 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
+            forward_batch=forward_batch,
             **(
                 dict(
                     forward_shared_experts=_forward_shared_experts_and_put_results,
@@ -3062,6 +3066,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                         layer_id = int(name.split(".")[2])
                         if layer_id < self.config.num_hidden_layers:
                             layer_ids.add(layer_id)
+                layer_ids = range(self.model.start_layer, self.model.end_layer)
 
         for layer_id in layer_ids:
             self_attn = (

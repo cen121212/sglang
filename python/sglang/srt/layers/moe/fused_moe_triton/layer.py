@@ -234,6 +234,13 @@ class FusedMoE(torch.nn.Module):
             isinstance(self.quant_method, Fp8MoEMethod)
             and self.quant_method._should_use_cutlass_fused_experts()
         )
+        from ..fused_moe_triton.all2allv import TokenDispatcherWithAll2AllV
+
+        self.all2all_v = TokenDispatcherWithAll2AllV(
+            num_local_experts=self.moe_runner_config.num_local_experts,
+            top_k=self.top_k,
+            num_experts=self.num_experts,
+        )
 
     def _load_per_tensor_weight_scale(
         self,

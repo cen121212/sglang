@@ -1030,6 +1030,7 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         self,
         layer,
         dispatch_output: StandardDispatchOutput,
+        forward_batch=None,
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 

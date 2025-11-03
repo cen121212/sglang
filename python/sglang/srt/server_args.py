@@ -254,6 +254,7 @@ class ServerArgs:
     device: Optional[str] = None
     tp_size: int = 1
     pp_size: int = 1
+    pp_async_batch_depth: int = 0
     pp_max_micro_batch_size: Optional[int] = None
     stream_interval: int = 1
     stream_output: bool = False
@@ -324,9 +325,10 @@ class ServerArgs:
     enable_lora: Optional[bool] = None
     max_lora_rank: Optional[int] = None
     lora_target_modules: Optional[Union[set[str], List[str]]] = None
-    lora_paths: Optional[
-        Union[dict[str, str], List[dict[str, str]], List[str], List[LoRARef]]
-    ] = None
+    # lora_paths: Optional[
+    #     Union[dict[str, str], List[dict[str, str]], List[str], List[LoRARef]]
+    # ] = None
+    lora_paths: Optional[Union[dict[str, str], dict[str, LoRARef], List[str]]] = None
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
     lora_eviction_policy: str = "lru"
@@ -914,11 +916,10 @@ class ServerArgs:
             )
 
             if is_sm100_supported():
-                if not self.enable_dp_attention:
-                    self.enable_flashinfer_allreduce_fusion = True
-                    logger.info(
-                        "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
-                    )
+                self.enable_flashinfer_allreduce_fusion = True
+                logger.info(
+                    "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
+                )
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None
@@ -1155,6 +1156,11 @@ class ServerArgs:
                     f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
                 )
                 self.page_size = 64
+            
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "trtllm_mla backend does not support speculative decoding yet."
+                )
 
             if self.kv_cache_dtype not in ["fp8_e4m3", "auto"]:
                 raise ValueError(
@@ -1904,6 +1910,14 @@ class ServerArgs:
             '* "float" is shorthand for FP32 precision.\n'
             '* "float32" for FP32 precision.',
         )
+
+        parser.add_argument(
+            "--pp-async-batch-depth",
+            type=int,
+            default=ServerArgs.pp_async_batch_depth,
+            help="The async batch depth in pipeline parallelism.",
+        )
+
         parser.add_argument(
             "--quantization",
             type=str,
@@ -3629,42 +3643,30 @@ class ServerArgs:
                 )
 
         if self.enable_lora:
+            # Normalize lora_paths to a dictionary if it is a list.
+            # TODO (lifuhuang): support specifying pinned adapters in server_args.
             if isinstance(self.lora_paths, list):
                 lora_paths = self.lora_paths
-                self.lora_paths = []
+                # self.lora_paths = []
+                self.lora_paths = {}
                 for lora_path in lora_paths:
-                    if isinstance(lora_path, str):
-                        if "=" in lora_path:
-                            name, path = lora_path.split("=", 1)
-                            lora_ref = LoRARef(
-                                lora_name=name, lora_path=path, pinned=False
-                            )
-                        else:
-                            lora_ref = LoRARef(
-                                lora_name=lora_path, lora_path=lora_path, pinned=False
-                            )
-                    elif isinstance(lora_path, dict):
-                        assert (
-                            "lora_name" in lora_path and "lora_path" in lora_path
-                        ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
-                        lora_ref = LoRARef(
-                            lora_name=lora_path["lora_name"],
-                            lora_path=lora_path["lora_path"],
-                            pinned=lora_path.get("pinned", False),
+                    if "=" in lora_path:
+                        name, path = lora_path.split("=", 1)
+                        self.lora_paths[name] = LoRARef(
+                            lora_name=name, lora_path=path, pinned=False
                         )
                     else:
-                        raise ValueError(
-                            f"Invalid type for item in --lora-paths list: {type(lora_path)}. "
-                            "Expected a string or a dictionary."
+                        self.lora_paths[lora_path] = LoRARef(
+                            lora_name=lora_path, lora_path=lora_path, pinned=False
                         )
-                    self.lora_paths.append(lora_ref)
+                    
             elif isinstance(self.lora_paths, dict):
-                self.lora_paths = [
-                    LoRARef(lora_name=k, lora_path=v, pinned=False)
+                self.lora_paths = {
+                    k: LoRARef(lora_name=k, lora_path=v, pinned=False)
                     for k, v in self.lora_paths.items()
-                ]
+                }
             elif self.lora_paths is None:
-                self.lora_paths = []
+                self.lora_paths = {}
             else:
                 raise ValueError(
                     f"Invalid type for --lora-paths: {type(self.lora_paths)}. "
@@ -3691,7 +3693,9 @@ class ServerArgs:
                     "max_loaded_loras should be greater than or equal to max_loras_per_batch. "
                     f"max_loaded_loras={self.max_loaded_loras}, max_loras_per_batch={self.max_loras_per_batch}"
                 )
-                assert len(self.lora_paths) <= self.max_loaded_loras, (
+                assert (
+                    not self.lora_paths or len(self.lora_paths) <= self.max_loaded_loras
+                ), (
                     "The number of LoRA paths should not exceed max_loaded_loras. "
                     f"max_loaded_loras={self.max_loaded_loras}, lora_paths={len(self.lora_paths)}"
                 )
@@ -3950,22 +3954,13 @@ class PortArgs:
 
 class LoRAPathAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
-        lora_paths = []
-        if values:
-            assert isinstance(values, list), "Expected a list of LoRA paths."
-            for lora_path in values:
-                lora_path = lora_path.strip()
-                if lora_path.startswith("{") and lora_path.endswith("}"):
-                    obj = json.loads(lora_path)
-                    assert "lora_path" in obj and "lora_name" in obj, (
-                        f"{repr(lora_path)} looks like a JSON str, "
-                        "but it does not contain 'lora_name' and 'lora_path' keys."
-                    )
-                    lora_paths.append(obj)
-                else:
-                    lora_paths.append(lora_path)
-
-        setattr(namespace, self.dest, lora_paths)
+        setattr(namespace, self.dest, {})
+        for lora_path in values:
+            if "=" in lora_path:
+                name, path = lora_path.split("=", 1)
+                getattr(namespace, self.dest)[name] = path
+            else:
+                getattr(namespace, self.dest)[lora_path] = lora_path
 
 
 class DeprecatedAction(argparse.Action):

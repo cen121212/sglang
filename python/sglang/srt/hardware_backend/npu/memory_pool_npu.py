@@ -353,10 +353,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             kv_item_lens += [
                 self.index_k_buffer[i][0].nbytes for i in range(self.layer_num)
             ]
-        from sglang.srt.distributed import get_world_rank
-        print(f'=={get_world_rank()}==={self.layer_num=}===k_buffer:{kv_data_ptrs[:self.layer_num]=} \n')
-        print(f'=={get_world_rank()}==={self.layer_num=}===v_buffer:{kv_data_ptrs[self.layer_num:2 * self.layer_num]=} \n')
-        print(f'=={get_world_rank()}==={self.layer_num=}===index_k_buffer:{kv_data_ptrs[2 * self.layer_num:]=} \n')
+
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def set_kv_buffer(

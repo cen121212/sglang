@@ -383,10 +383,32 @@ def forward_dsa_prepare_npu(
                 q = m.q_a_layernorm(q)
 
                 q_lora = q.clone()  # required for topk_indices
-                k_nope, k_pe = latent_cache.unsqueeze(1).split(
-                    [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
+                # 1 从 forward_batch 提取底层物理地址
+                ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(m.layer_id)
+                slots = forward_batch.out_cache_loc.to(torch.int64)
+
+                cos_sin = m.rotary_emb.cos_sin_cache.index_select(0, positions)
+                rotary_dim = m.qk_rope_head_dim  # 即 rotary_dim
+                half_dim = rotary_dim // 2
+                cos = cos_sin[..., 0::2].contiguous().view(-1, 1, 1, half_dim)
+                sin = cos_sin[..., 1::2].contiguous().view(-1, 1, 1, half_dim)
+
+                # 2 调用 NPU 融合算子 (只处理标准 MLA，自动写入 ckv 和 k_rope 坑位)
+                _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
+                    latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
+                    m.kv_a_layernorm.weight,
+                    cos,
+                    sin,
+                    slots,
+                    k_rope_cache,
+                    ckv_cache,
+                    epsilon=m.kv_a_layernorm.variance_epsilon,
+                    cache_mode="PA_NZ" if is_fia_nz() else "PA_BNSD",
+                    is_output_kv=True, 
                 )
-                k_nope = m.kv_a_layernorm(k_nope)
+                k_pe = k_pe.view(-1, m.qk_rope_head_dim)
+                k_nope = kv_a.squeeze(1)
+
             q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
@@ -400,7 +422,12 @@ def forward_dsa_prepare_npu(
                 0, positions
             )
 
-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        if m.rotary_emb.is_neox_style:
+            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        else:
+            q_pe = q_pe.unsqueeze(2)
+            q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin)
+            q_pe = q_pe.unsqueeze(2)
 
         if nsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange

@@ -267,8 +267,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     dtype=self.store_dtype,
                     device=self.device,
                 )
-        from sglang.srt.distributed import get_world_rank
-        # print(f'==={get_world_rank()}====={layer_num=}=={self.start_layer=}== {self.index_k_buffer.data_ptr()=}, {self.k_buffer.data_ptr()=}, {self.v_buffer.data_ptr()=}')
 
         self._finalize_allocation_log(size)
 

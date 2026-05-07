@@ -746,24 +746,24 @@ class DecodePreallocQueue:
             required_tokens_for_request = (
                 origin_input_len + self.num_reserved_decode_tokens
             )
+            # 判断剩余的kv是否大于当前请求所需的token
+            # if (
+            #     max(
+            #         required_tokens_for_request,
+            #         origin_input_len
+            #         + min(
+            #             decode_req.req.sampling_params.max_new_tokens,
+            #             CLIP_MAX_NEW_TOKEN,
+            #         )
+            #         - retractable_tokens,
+            #     )
+            #     > allocatable_tokens
+            # ):
+            #     break
+            # if required_tokens_for_request > allocatable_tokens:
+            #     break
 
-            if (
-                max(
-                    required_tokens_for_request,
-                    origin_input_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
-                )
-                > allocatable_tokens
-            ):
-                break
-            if required_tokens_for_request > allocatable_tokens:
-                break
-
-            allocatable_tokens -= required_tokens_for_request
+            # allocatable_tokens -= required_tokens_for_request
             req = decode_req.req
 
             if self.scheduler.enable_hisparse:
@@ -778,6 +778,7 @@ class DecodePreallocQueue:
                     .numpy()
                     .astype(np.int32)
                 )
+                allocatable_tokens -= required_tokens_for_request
             else:
                 page_size = self.token_to_kv_pool_allocator.page_size
 
@@ -813,7 +814,7 @@ class DecodePreallocQueue:
                             self.tree_cache.inc_lock_ref(last_node)
                             req.prefix_indices = prefix_indices
                             req.last_node = last_node
-
+                allocatable_tokens = allocatable_tokens + decode_prefix_len - required_tokens_for_request
                 req.disagg_decode_prefix_len = decode_prefix_len
                 self._pre_alloc(
                     req,

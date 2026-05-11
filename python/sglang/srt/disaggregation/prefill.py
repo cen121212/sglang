@@ -28,6 +28,7 @@ import torch
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.distributed import is_pipeline_last_stage
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -53,6 +54,8 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+
+from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -147,15 +150,18 @@ class PrefillBootstrapQueue:
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
 
-        if self.draft_token_to_kv_pool is not None:
+        if self.draft_token_to_kv_pool is not None and is_pipeline_last_stage():
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
+            # Now assume that the MTP has only one layer.
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
             kv_item_lens += draft_kv_item_lens
+        if self.draft_token_to_kv_pool is not None:
+            kv_args.has_draft_pool = True
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
@@ -190,7 +196,7 @@ class PrefillBootstrapQueue:
                     kv_args.state_dim_per_tensor = (
                         self.token_to_kv_pool.get_state_dim_per_tensor()
                     )
-            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
+            elif isinstance(self.token_to_kv_pool, (NPUMLATokenToKVPool, NSATokenToKVPool)):
                 kv_args.state_type = "nsa"
             else:
                 kv_args.state_type = "none"
@@ -335,8 +341,28 @@ class PrefillBootstrapQueue:
             )
             assert req.metadata_buffer_index is not None
 
-            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
-            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+            page_size = self.token_to_kv_pool.page_size
+            total_pages = kv_to_page_num(num_kv_indices, page_size)
+
+            # Read decode_prefix_len from the bootstrap message to skip
+            # transferring KV that the decode side already has cached.
+            decode_prefix_len = self.kv_manager.get_decode_prefix_len(
+                req.bootstrap_room
+            )
+            logger.info(
+                f"Prefill bootstrap for {req.rid}: "
+                f"decode_prefix_len={decode_prefix_len}, total_pages={total_pages}, "
+                f"bootstrap_room={req.bootstrap_room}"
+            )
+            if decode_prefix_len > 0:
+                req.start_send_idx = decode_prefix_len
+                req.disagg_prefill_skip_tokens = decode_prefix_len
+                decode_prefix_pages = kv_to_page_num(decode_prefix_len, page_size)
+                incremental_pages = total_pages - decode_prefix_pages
+            else:
+                incremental_pages = total_pages
+
+            req.disagg_kv_sender.init(incremental_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
@@ -658,18 +684,20 @@ class SchedulerDisaggregationPrefillMixin:
             req.time_stats.set_completion_time()
 
         page_size = self.token_to_kv_pool_allocator.page_size
-        kv_item_lens = (
-            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.kv_item_lens
-        )
-        bytes_per_page_all_layers = sum(kv_item_lens)
+        kv_args = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args
+        bytes_per_page_all_layers = sum(kv_args.kv_item_lens)
+        state_bytes_per_req = sum(kv_args.state_item_lens) if kv_args.state_item_lens else 0
 
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
                 continue
+            # Use actual transferred tokens (excluding decode-side cached prefix)
+            actual_transfer_tokens = len(req.origin_input_ids) - req.disagg_prefill_skip_tokens
             metrics = req.time_stats.compute_and_observe_kv_transfer_metrics(
-                num_tokens=len(req.origin_input_ids),
+                num_tokens=actual_transfer_tokens,
                 page_size=page_size,
                 bytes_per_page_all_layers=bytes_per_page_all_layers,
+                state_bytes_per_req=state_bytes_per_req,
             )
             if metrics:
                 # Update last-value for REST API
@@ -767,7 +795,6 @@ class SchedulerDisaggregationPrefillMixin:
             .cpu()
             .numpy()
         )
-        req.start_send_idx = end_idx
         state_indices = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
@@ -819,4 +846,5 @@ class SchedulerDisaggregationPrefillMixin:
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
+        req.start_send_idx = end_idx
         req.disagg_kv_sender.send(page_indices, state_indices)

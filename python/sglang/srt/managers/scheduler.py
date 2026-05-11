@@ -2775,12 +2775,11 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
-                # kwargs = (
-                #     {"pp_proxy_tensors": pp_proxy_tensors}
-                #     if self.spec_algorithm.is_none()
-                #     else {}
-                # )
-                kwargs = {"pp_proxy_tensors": pp_proxy_tensors}
+                kwargs = (
+                    {"pp_proxy_tensors": pp_proxy_tensors}
+                    if self.spec_algorithm.is_none()
+                    else {}
+                )
                 with self.record_forward_metrics(batch):
                     batch_result = self.model_worker.forward_batch_generation(
                         worker_batch_or_batch, **kwargs
@@ -3266,16 +3265,6 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                # Protect tree-owned prefix pages from being freed.
-                if req.disagg_decode_prefix_len > 0:
-                    req.cache_protected_len = req.disagg_decode_prefix_len
-                # Ensure last_node is valid for dec_lock_ref inside
-                # cache_finished_req. When no prefix was matched in
-                # pop_preallocated, last_node was never set (stays None).
-                if req.last_node is None and hasattr(
-                    self.tree_cache, "root_node"
-                ):
-                    req.last_node = self.tree_cache.root_node
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:

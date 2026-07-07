@@ -121,6 +121,15 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        # draft_forward reads this (set in EagleDraftWorker.__init__, skipped here).
+        self.index_share_for_mtp_iteration = (
+            getattr(
+                self.draft_runner.model_config.hf_config,
+                "index_share_for_mtp_iteration",
+                False,
+            )
+            and self.topk == 1
+        )
 
     def init_lm_head(self):
         """Override to prevent sharing embeddings and lm_head with target model."""

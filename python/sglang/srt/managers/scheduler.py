@@ -3846,7 +3846,11 @@ class Scheduler(
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
-            elif not batch.spec_algorithm.is_none() and self.pp_group.is_last_rank:
+            elif (
+                not batch.spec_algorithm.is_none()
+                and self.pp_group.is_last_rank
+                and _is_npu
+            ):
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
                     if self.ps.pp_size > 1
@@ -3877,7 +3881,11 @@ class Scheduler(
                     return_hidden_states=batch.return_hidden_states,
                 )
             else:
-                kwargs = {"pp_proxy_tensors": pp_proxy_tensors}
+                kwargs = (
+                    {"pp_proxy_tensors": pp_proxy_tensors}
+                    if (self.spec_algorithm.is_none() or _is_npu)
+                    else {}
+                )
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs

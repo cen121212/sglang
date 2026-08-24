@@ -17,6 +17,10 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
@@ -1032,7 +1036,11 @@ class SchedulerPPMixin:
                 **logprob_dict,
             }
 
-        if not batch.spec_algorithm.is_none() and result.next_draft_input is not None:
+        if (
+            not batch.spec_algorithm.is_none()
+            and result.next_draft_input is not None
+            and _is_npu
+        ):
             draft_input = result.next_draft_input
             if draft_input.topk_p is not None:
                 tensor_dict["draft_topk_p"] = draft_input.topk_p
@@ -1196,6 +1204,7 @@ class SchedulerPPMixin:
         next_draft_input = None
         if (
             not batch.spec_algorithm.is_none()
+            and _is_npu
             and pp_outputs.tensors.get("draft_topk_p") is not None
         ):
             next_draft_input = EagleDraftInput(

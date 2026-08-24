@@ -228,7 +228,7 @@ class PrefillBootstrapQueue:
         if (
             self.draft_token_to_kv_pool is not None
             and transfer_draft_cache
-            and get_pp_group().is_last_rank
+            and (not _is_npu or get_pp_group().is_last_rank)
         ):
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.

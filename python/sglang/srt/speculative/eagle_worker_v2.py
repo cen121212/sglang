@@ -285,7 +285,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_lm_head(self):
         from sglang.srt.lora.layers import unwrap_lora_layer
 
-        if self.draft_worker.pp_group.is_last_rank:
+        if not _is_npu or self.draft_worker.pp_group.is_last_rank:
             embed, head = self.target_worker.model_runner.model.get_embed_and_head()
             target_lm_head = unwrap_lora_layer(
                 getattr(self.target_worker.model_runner.model, "lm_head", None)
@@ -1158,7 +1158,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            if self.draft_worker.draft_worker.pp_group.is_last_rank:
+            if not _is_npu or self.draft_worker.draft_worker.pp_group.is_last_rank:
                 # Target prefill
                 target_capture_mode = (
                     CaptureHiddenMode.NULL

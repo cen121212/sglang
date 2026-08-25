@@ -3846,9 +3846,8 @@ class Scheduler(
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
-            elif (
-                not batch.spec_algorithm.is_none()
-                and (not _is_npu or self.pp_group.is_last_rank)
+            elif not batch.spec_algorithm.is_none() and (
+                not _is_npu or self.pp_group.is_last_rank
             ):
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}

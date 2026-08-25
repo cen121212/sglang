@@ -9822,6 +9822,9 @@ class ServerArgs:
                         self.speculative_algorithm.upper() == "EAGLE"
                         and not self.enable_multi_layer_eagle
                     ), "Pipeline parallelism currently only supports EAGLE (non-multi-layer) speculative decoding"
+                    assert (
+                        self.disaggregation_mode == "prefill"
+                    ), "NPU PP + speculative decoding (MTP) is only supported on prefill nodes (disaggregation-mode=prefill)"
             else:
                 # Non-NPU: PP + speculative decoding is not supported
                 assert (

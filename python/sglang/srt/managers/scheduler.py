@@ -3848,8 +3848,7 @@ class Scheduler(
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif (
                 not batch.spec_algorithm.is_none()
-                and self.pp_group.is_last_rank
-                and _is_npu
+                and (not _is_npu or self.pp_group.is_last_rank)
             ):
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}

@@ -1417,9 +1417,13 @@ class SchedulerPPMixin:
         # adjacent pair has one sender and one receiver posted at the
         # same time.
 
-        # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        # CUDA/HIP send operations make progress after being enqueued, so all
+        # ranks can send first. NPU/XPU communication may wait for a matching
+        # recv on the peer; order adjacent PP ranks oppositely to avoid a
+        # device-side send -> recv cycle once the output ring is full.
+        send_first = (
+            (self.ps.pp_rank % 2) == 0 if (_is_npu or is_xpu()) else True
+        )
 
         logger.warning(
             "%s send/recv plan: pp_rank=%s tp_rank=%s cp_rank=%s "

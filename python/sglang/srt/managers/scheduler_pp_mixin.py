@@ -6,7 +6,7 @@ import time
 from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -44,6 +44,7 @@ from sglang.srt.utils.common import get_device_module, is_xpu, is_npu
 logger = logging.getLogger(__name__)
 
 _PP_OUTPUT_DEBUG_PREFIX = "[PP-OUTPUT-DEBUG]"
+_PP_SKIP_OUTPUT_COMM_KEY = "__skip_output_comm__"
 
 
 def _pp_debug_query_async_obj(obj):
@@ -91,6 +92,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
+    skip_output_comm: bool = False
 
 
 class SchedulerPPMixin:
@@ -221,7 +223,7 @@ class SchedulerPPMixin:
                             "send_proxy_dict_to_next_stage"
                         ):
                             self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                                result.pp_hidden_states_proxy_tensors.tensors,
+                                self._pp_prepare_proxy_tensors_for_send(mb_id, result),
                                 async_send=True,
                                 msg_type="proxy",
                             )
@@ -424,7 +426,7 @@ class SchedulerPPMixin:
                             self.launch_event
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
+                            self._pp_prepare_proxy_tensors_for_send(mb_id, result),
                             async_send=True,
                             msg_type="proxy",
                         )
@@ -613,7 +615,7 @@ class SchedulerPPMixin:
                             self.launch_event
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
+                            self._pp_prepare_proxy_tensors_for_send(mb_id, result),
                             async_send=True,
                             msg_type="proxy",
                         )
@@ -1229,15 +1231,34 @@ class SchedulerPPMixin:
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self._pp_recv_typed_dict(
-                    expected_kind="proxy",
-                    all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
-                    ),
-                )
+            tensor_dict = self._pp_recv_typed_dict(
+                expected_kind="proxy",
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
             )
+            skip_output_comm = bool(tensor_dict.pop(_PP_SKIP_OUTPUT_COMM_KEY, False))
+            pp_proxy_tensors = PPProxyTensors(tensor_dict)
+            pp_proxy_tensors.skip_output_comm = skip_output_comm
         return pp_proxy_tensors
+
+    def _pp_prepare_proxy_tensors_for_send(
+        self: Scheduler, mb_id: int, result: GenerationBatchResult
+    ) -> Dict[str, Any]:
+        tensor_dict = result.pp_hidden_states_proxy_tensors.tensors
+        metadata = self.mb_metadata[mb_id]
+        assert metadata is not None, f"Missing PP metadata for micro-batch {mb_id}"
+        tensor_dict[_PP_SKIP_OUTPUT_COMM_KEY] = metadata.skip_output_comm
+        return tensor_dict
+
+    def _pp_should_skip_output_comm(
+        self: Scheduler,
+        metadata: Optional[PPBatchMetadata],
+    ) -> bool:
+        # PP0's decision already includes the environment flag and all batch
+        # predicates. Downstream ranks must consume that exact decision rather
+        # than combining it with potentially different local state.
+        return bool(metadata is not None and metadata.skip_output_comm)
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
@@ -1317,6 +1338,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         next_first_rank_mb_id: int,
         mbs: List[ScheduleBatch],
+        mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
         pp_outputs: PPProxyTensors | None,
     ) -> List[P2PWork]:
@@ -1328,7 +1350,9 @@ class SchedulerPPMixin:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
                 if (
                     not target.forward_mode.is_prebuilt()
-                    and not _pp_can_skip_output_comm(target)
+                    and not self._pp_should_skip_output_comm(
+                        mb_metadata[next_first_rank_mb_id]
+                    )
                 ):
                     logger.warning(
                         "%s send begin: role=last-new-output pp_rank=%s "
@@ -1445,6 +1469,7 @@ class SchedulerPPMixin:
             return self._pp_send_output_to_next_stage(
                 next_first_rank_mb_id,
                 mbs,
+                mb_metadata,
                 last_rank_comm_queue,
                 pp_outputs,
             )
@@ -1500,7 +1525,7 @@ class SchedulerPPMixin:
             target = mbs[next_mb_id]
             if target is None or target.forward_mode.is_prebuilt():
                 return
-            if _pp_can_skip_output_comm(target):
+            if self._pp_should_skip_output_comm(mb_metadata[next_mb_id]):
                 next_pp_outputs, batch_result, d2h_event = (
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
                 )
@@ -1524,14 +1549,16 @@ class SchedulerPPMixin:
             can_send_output = (
                 send_target is not None
                 and not send_target.forward_mode.is_prebuilt()
-                and not _pp_can_skip_output_comm(send_target)
+                and not self._pp_should_skip_output_comm(
+                    mb_metadata[next_first_rank_mb_id]
+                )
             )
         else:
             can_send_output = pp_outputs is not None
         can_recv_output = (
             recv_target is not None
             and not recv_target.forward_mode.is_prebuilt()
-            and not _pp_can_skip_output_comm(recv_target)
+            and not self._pp_should_skip_output_comm(mb_metadata[next_mb_id])
         )
         use_atomic_npu_exchange = (
             is_npu()
@@ -1618,6 +1645,29 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
     ):
+        if self.pp_group.is_first_rank:
+            skip_output_comm = _pp_can_skip_output_comm(cur_batch)
+        elif pp_proxy_tensors is not None:
+            skip_output_comm = bool(
+                getattr(pp_proxy_tensors, "skip_output_comm", False)
+            )
+            local_skip_output_comm = _pp_can_skip_output_comm(cur_batch)
+            if local_skip_output_comm != skip_output_comm:
+                logger.warning(
+                    "%s synchronized skip decision differs from local batch: "
+                    "pp_rank=%s tp_rank=%s cp_rank=%s mb_id=%s "
+                    "synchronized_skip=%s local_skip=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_tp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                    skip_output_comm,
+                    local_skip_output_comm,
+                )
+        else:
+            skip_output_comm = False
+
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
@@ -1635,6 +1685,7 @@ class SchedulerPPMixin:
                 )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
+                    skip_output_comm=skip_output_comm,
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())

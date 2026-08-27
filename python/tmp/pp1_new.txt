@@ -1,0 +1,37 @@
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/share/l00890003/codes/sglang/python/sglang/srt/managers/scheduler.py", line 3131, in get_next_batch_to_run
+    prefill_plan = self.get_new_batch_prefill(running_batch)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/share/l00890003/codes/sglang/python/sglang/srt/managers/scheduler.py", line 3197, in get_new_batch_prefill
+    ret, running_batch = self._get_new_batch_prefill_raw(
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/share/l00890003/codes/sglang/python/sglang/srt/managers/scheduler.py", line 3435, in _get_new_batch_prefill_raw
+    new_batch.prepare_for_extend()
+  File "/mnt/share/l00890003/codes/sglang/python/sglang/srt/managers/schedule_batch.py", line 2628, in prepare_for_extend
+    self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/share/l00890003/codes/sglang/python/sglang/srt/sampling/sampling_batch_info.py", line 99, in from_schedule_batch
+    .to(device, non_blocking=True)
+     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/contrib/transfer_to_npu.py", line 191, in decorated
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+RuntimeError: The Inner error is reported as above. The process exits for this inner error, and the current working operator name is HcclSend.
+Since the operator is called asynchronously, the stacktrace may be inaccurate. If you want to get the accurate stacktrace, please set the environment variable ASCEND_LAUNCH_BLOCKING=1.
+Note: ASCEND_LAUNCH_BLOCKING=1 will force ops to run in synchronous mode, resulting in performance degradation. Please unset ASCEND_LAUNCH_BLOCKING in time after debugging.
+[ERROR] 2026-08-27-09:36:19 (PID:599508, Device:0, RankID:-1) ERR00100 PTA call acl api failed.
+
+
+[2026-08-27 09:36:19] Received sigquit from a child process. It usually means the child failed.
+[2026-08-27 09:36:19] kill_process_tree called: parent_pid=599333, include_parent=True, pid=599333
+[2026-08-27 09:36:19] Received sigquit from a child process. It usually means the child failed.
+[2026-08-27 09:36:19] kill_process_tree called: parent_pid=599333, include_parent=True, pid=599333
+W0827 09:36:19.947164 599515 ../torch_npu/csrc/distributed/ProcessGroupHCCL.cpp:986] Process group work SEND, seq_num 0 dispatch success. This warning log can be ignored.
+W0827 09:36:19.947200 599509 ../torch_npu/csrc/distributed/ProcessGroupHCCL.cpp:986] Process group work SEND, seq_num 0 dispatch success. This warning log can be ignored.
+W0827 09:36:19.947249 599512 ../torch_npu/csrc/distributed/ProcessGroupHCCL.cpp:986] Process group work SEND, seq_num 0 dispatch success. This warning log can be ignored.
+W0827 09:36:19.947278 599511 ../torch_npu/csrc/distributed/ProcessGroupHCCL.cpp:986] Process group work SEND, seq_num 0 dispatch success. This warning log can be ignored.
+W0827 09:36:19.947421 599510 ../torch_npu/csrc/distributed/ProcessGroupHCCL.cpp:986] Process group work SEND, seq_num 0 dispatch success. This warning log can be ignored.
+W0827 09:36:19.947581 599514 ../torch_npu/csrc/distributed/ProcessGroupHCCL.cpp:986] Process group work SEND, seq_num 0 dispatch success. This warning log can be ignored.
+W0827 09:36:19.947715 599513 ../torch_npu/csrc/distributed/ProcessGroupHCCL.cpp:986] Process group work SEND, seq_num 0 dispatch success. This warning log can be ignored.
+W0827 09:36:19.948073 599508 ../torch_npu/csrc/distributed/ProcessGroupHCCL.cpp:986] Process group work SEND, seq_num 0 dispatch success. This warning log can be ignored.

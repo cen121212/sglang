@@ -1449,27 +1449,10 @@ class SchedulerPPMixin:
                 pp_outputs,
             )
 
-        def _do_recv():
+        def _preprocess_received_output(tensor_dict):
             nonlocal next_pp_outputs, batch_result, d2h_event
             target = mbs[next_mb_id]
-            if target is None or target.forward_mode.is_prebuilt():
-                return
-            if _pp_can_skip_output_comm(target):
-                next_pp_outputs, batch_result, d2h_event = (
-                    self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
-                )
-                return
-            logger.warning(
-                "%s recv begin: pp_rank=%s tp_rank=%s cp_rank=%s "
-                "next_mb=%s",
-                _PP_OUTPUT_DEBUG_PREFIX,
-                self.ps.pp_rank,
-                self.ps.attn_tp_rank,
-                self.ps.attn_cp_rank,
-                next_mb_id,
-            )
-            with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
+            next_pp_outputs = PPProxyTensors(tensor_dict)
             logger.warning(
                 "%s recv returned: pp_rank=%s tp_rank=%s cp_rank=%s "
                 "next_mb=%s keys=%s",
@@ -1511,6 +1494,112 @@ class SchedulerPPMixin:
                     next_mb_id,
                     d2h_event,
                 )
+
+        def _do_recv():
+            nonlocal next_pp_outputs, batch_result, d2h_event
+            target = mbs[next_mb_id]
+            if target is None or target.forward_mode.is_prebuilt():
+                return
+            if _pp_can_skip_output_comm(target):
+                next_pp_outputs, batch_result, d2h_event = (
+                    self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
+                )
+                return
+            logger.warning(
+                "%s recv begin: pp_rank=%s tp_rank=%s cp_rank=%s "
+                "next_mb=%s",
+                _PP_OUTPUT_DEBUG_PREFIX,
+                self.ps.pp_rank,
+                self.ps.attn_tp_rank,
+                self.ps.attn_cp_rank,
+                next_mb_id,
+            )
+            with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
+                tensor_dict = self._pp_recv_dict_from_prev_stage()
+            _preprocess_received_output(tensor_dict)
+
+        send_target = mbs[next_first_rank_mb_id]
+        recv_target = mbs[next_mb_id]
+        if self.pp_group.is_last_rank:
+            can_send_output = (
+                send_target is not None
+                and not send_target.forward_mode.is_prebuilt()
+                and not _pp_can_skip_output_comm(send_target)
+            )
+        else:
+            can_send_output = pp_outputs is not None
+        can_recv_output = (
+            recv_target is not None
+            and not recv_target.forward_mode.is_prebuilt()
+            and not _pp_can_skip_output_comm(recv_target)
+        )
+        use_atomic_npu_exchange = (
+            is_npu()
+            and can_send_output
+            and can_recv_output
+        )
+
+        if use_atomic_npu_exchange:
+            if self.pp_group.is_last_rank:
+                q_event, output_to_send = last_rank_comm_queue.popleft()
+                self.device_module.current_stream().wait_event(q_event)
+                send_tensor_dict = output_to_send.tensors
+                send_role = "last-new-output"
+            else:
+                send_tensor_dict = pp_outputs.tensors
+                send_role = "forward-old-output"
+
+            send_tensor_dict["__msg_type__"] = "output"
+            logger.warning(
+                "%s atomic send/recv begin: pp_rank=%s tp_rank=%s cp_rank=%s "
+                "send_role=%s send_target_mb=%s recv_target_mb=%s keys=%s",
+                _PP_OUTPUT_DEBUG_PREFIX,
+                self.ps.pp_rank,
+                self.ps.attn_tp_rank,
+                self.ps.attn_cp_rank,
+                send_role,
+                next_first_rank_mb_id,
+                next_mb_id,
+                sorted(send_tensor_dict.keys()),
+            )
+            with torch.profiler.record_function("send_recv_res_dict"):
+                received_tensor_dict = self.pp_group.send_recv_tensor_dict(
+                    send_tensor_dict=send_tensor_dict,
+                    send_all_gather_group=(
+                        self.attn_tp_group
+                        if self.require_attn_tp_allgather
+                        else None
+                    ),
+                    recv_all_gather_group=(
+                        self.attn_tp_group
+                        if self.require_attn_tp_allgather
+                        else None
+                    ),
+                )
+            received_kind = received_tensor_dict.get("__msg_type__", "default")
+            if received_kind != "output":
+                raise RuntimeError(
+                    "Atomic NPU PP output exchange received unexpected message "
+                    f"type {received_kind!r}; expected 'output'."
+                )
+            output_inbox = self._pp_tensor_dict_inbox.get("output")
+            if output_inbox:
+                tensor_dict_to_process = output_inbox.popleft()
+                output_inbox.append(received_tensor_dict)
+            else:
+                tensor_dict_to_process = received_tensor_dict
+            logger.warning(
+                "%s atomic send/recv returned: pp_rank=%s tp_rank=%s "
+                "cp_rank=%s send_target_mb=%s recv_target_mb=%s",
+                _PP_OUTPUT_DEBUG_PREFIX,
+                self.ps.pp_rank,
+                self.ps.attn_tp_rank,
+                self.ps.attn_cp_rank,
+                next_first_rank_mb_id,
+                next_mb_id,
+            )
+            _preprocess_received_output(tensor_dict_to_process)
+            return next_pp_outputs, batch_result, d2h_event, []
 
         if send_first:
             send_output_work = _do_send()

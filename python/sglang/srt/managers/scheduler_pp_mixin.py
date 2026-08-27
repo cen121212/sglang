@@ -62,6 +62,16 @@ def _pp_debug_query_async_obj(obj):
     return "query-unavailable" if not errors else "query-failed:" + ";".join(errors)
 
 
+def _pp_debug_payload_metadata(payload):
+    """Describe a P2P payload without formatting tensor values or synchronizing."""
+    if isinstance(payload, torch.Tensor):
+        return (
+            f"Tensor(shape={tuple(payload.shape)},dtype={payload.dtype},"
+            f"device={payload.device})"
+        )
+    return f"{type(payload).__module__}.{type(payload).__qualname__}"
+
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -1008,7 +1018,7 @@ class SchedulerPPMixin:
         for work_index, p2p_work in enumerate(work):
             logger.warning(
                 "%s p2p work wait begin: pp_rank=%s tp_rank=%s cp_rank=%s "
-                "work_index=%s work_count=%s p2p_work=%s backend_work=%s "
+                "work_index=%s work_count=%s payload=%s backend_work_type=%s "
                 "work_ready=%s",
                 _PP_OUTPUT_DEBUG_PREFIX,
                 self.ps.pp_rank,
@@ -1016,8 +1026,8 @@ class SchedulerPPMixin:
                 self.ps.attn_cp_rank,
                 work_index,
                 work_count,
-                p2p_work,
-                p2p_work.work,
+                _pp_debug_payload_metadata(p2p_work.payload),
+                type(p2p_work.work).__qualname__,
                 _pp_debug_query_async_obj(p2p_work.work),
             )
             p2p_work.work.wait()

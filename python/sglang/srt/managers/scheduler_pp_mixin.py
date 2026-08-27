@@ -45,6 +45,23 @@ logger = logging.getLogger(__name__)
 
 _PP_OUTPUT_DEBUG_PREFIX = "[PP-OUTPUT-DEBUG]"
 
+
+def _pp_debug_query_async_obj(obj):
+    """Best-effort, non-blocking completion query for PP diagnostics."""
+    if obj is None:
+        return None
+    errors = []
+    for method_name in ("query", "is_completed"):
+        method = getattr(obj, method_name, None)
+        if method is None:
+            continue
+        try:
+            return method()
+        except Exception as exc:
+            errors.append(f"{method_name}:{type(exc).__name__}:{exc}")
+    return "query-unavailable" if not errors else "query-failed:" + ";".join(errors)
+
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -151,7 +168,9 @@ class SchedulerPPMixin:
                 if self.mbs[next_mb_id] is not None:
                     logger.warning(
                         "%s d2h sync begin: pp_rank=%s tp_rank=%s cp_rank=%s "
-                        "mb_id=%s next_mb_id=%s event=%s",
+                        "mb_id=%s next_mb_id=%s event=%s event_ready=%s "
+                        "schedule_stream=%s schedule_ready=%s copy_stream=%s "
+                        "copy_ready=%s pending_output_work=%s",
                         _PP_OUTPUT_DEBUG_PREFIX,
                         self.ps.pp_rank,
                         self.ps.attn_tp_rank,
@@ -159,6 +178,12 @@ class SchedulerPPMixin:
                         mb_id,
                         next_mb_id,
                         d2h_event,
+                        _pp_debug_query_async_obj(d2h_event),
+                        self.schedule_stream,
+                        _pp_debug_query_async_obj(self.schedule_stream),
+                        self.copy_stream,
+                        _pp_debug_query_async_obj(self.copy_stream),
+                        len(self.send_output_work),
                     )
                     d2h_event.synchronize()
                     logger.warning(
@@ -979,8 +1004,33 @@ class SchedulerPPMixin:
         return send_release_work, release_rids
 
     def _pp_commit_comm_work(self: Scheduler, work: List[P2PWork]) -> None:
-        for p2p_work in work:
+        work_count = len(work)
+        for work_index, p2p_work in enumerate(work):
+            logger.warning(
+                "%s p2p work wait begin: pp_rank=%s tp_rank=%s cp_rank=%s "
+                "work_index=%s work_count=%s p2p_work=%s backend_work=%s "
+                "work_ready=%s",
+                _PP_OUTPUT_DEBUG_PREFIX,
+                self.ps.pp_rank,
+                self.ps.attn_tp_rank,
+                self.ps.attn_cp_rank,
+                work_index,
+                work_count,
+                p2p_work,
+                p2p_work.work,
+                _pp_debug_query_async_obj(p2p_work.work),
+            )
             p2p_work.work.wait()
+            logger.warning(
+                "%s p2p work wait end: pp_rank=%s tp_rank=%s cp_rank=%s "
+                "work_index=%s work_count=%s",
+                _PP_OUTPUT_DEBUG_PREFIX,
+                self.ps.pp_rank,
+                self.ps.attn_tp_rank,
+                self.ps.attn_cp_rank,
+                work_index,
+                work_count,
+            )
         work.clear()
 
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -1424,12 +1474,17 @@ class SchedulerPPMixin:
                 self.copy_stream.wait_stream(self.schedule_stream)
                 logger.warning(
                     "%s prep begin on copy stream: pp_rank=%s tp_rank=%s "
-                    "cp_rank=%s next_mb=%s",
+                    "cp_rank=%s next_mb=%s schedule_stream=%s "
+                    "schedule_ready=%s copy_stream=%s copy_ready=%s",
                     _PP_OUTPUT_DEBUG_PREFIX,
                     self.ps.pp_rank,
                     self.ps.attn_tp_rank,
                     self.ps.attn_cp_rank,
                     next_mb_id,
+                    self.schedule_stream,
+                    _pp_debug_query_async_obj(self.schedule_stream),
+                    self.copy_stream,
+                    _pp_debug_query_async_obj(self.copy_stream),
                 )
                 batch_result = self._pp_prep_batch_result(
                     target, mb_metadata[next_mb_id], next_pp_outputs

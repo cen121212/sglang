@@ -52,6 +52,8 @@ from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
+_PP_OUTPUT_DEBUG_PREFIX = "[PP-OUTPUT-DEBUG]"
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -156,7 +158,28 @@ class SchedulerPPMixin:
                         )
                     )
                 if self.mbs[next_mb_id] is not None:
+                    logger.warning(
+                        "%s d2h sync begin: pp_rank=%s tp_rank=%s cp_rank=%s "
+                        "mb_id=%s next_mb_id=%s event=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_tp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        next_mb_id,
+                        d2h_event,
+                    )
                     d2h_event.synchronize()
+                    logger.warning(
+                        "%s d2h sync end: pp_rank=%s tp_rank=%s cp_rank=%s "
+                        "mb_id=%s next_mb_id=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_tp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        next_mb_id,
+                    )
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
@@ -330,7 +353,28 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
+                    logger.warning(
+                        "%s d2h sync begin: loop=disagg_prefill pp_rank=%s "
+                        "tp_rank=%s cp_rank=%s mb_id=%s next_mb_id=%s event=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_tp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        next_mb_id,
+                        d2h_event,
+                    )
                     d2h_event.synchronize()
+                    logger.warning(
+                        "%s d2h sync end: loop=disagg_prefill pp_rank=%s "
+                        "tp_rank=%s cp_rank=%s mb_id=%s next_mb_id=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_tp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        next_mb_id,
+                    )
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
@@ -957,7 +1001,29 @@ class SchedulerPPMixin:
         Optional[GenerationBatchResult],
         Optional[torch.Event],
     ]:
+        logger.warning(
+            "%s commit begin: pp_rank=%s tp_rank=%s cp_rank=%s "
+            "next_first_mb=%s next_mb=%s pending_send_work=%s has_pp_outputs=%s",
+            _PP_OUTPUT_DEBUG_PREFIX,
+            self.ps.pp_rank,
+            self.ps.attn_tp_rank,
+            self.ps.attn_cp_rank,
+            next_first_rank_mb_id,
+            next_mb_id,
+            len(self.send_output_work),
+            self.pp_outputs is not None,
+        )
         self._pp_commit_comm_work(work=self.send_output_work)
+        logger.warning(
+            "%s previous send committed: pp_rank=%s tp_rank=%s cp_rank=%s "
+            "next_first_mb=%s next_mb=%s",
+            _PP_OUTPUT_DEBUG_PREFIX,
+            self.ps.pp_rank,
+            self.ps.attn_tp_rank,
+            self.ps.attn_cp_rank,
+            next_first_rank_mb_id,
+            next_mb_id,
+        )
         (
             next_pp_outputs,
             next_batch_result,
@@ -970,6 +1036,20 @@ class SchedulerPPMixin:
             self.mb_metadata,
             self.last_rank_comm_queue,
             self.pp_outputs,
+        )
+        logger.warning(
+            "%s commit end: pp_rank=%s tp_rank=%s cp_rank=%s "
+            "next_first_mb=%s next_mb=%s received_output=%s d2h_event=%s "
+            "new_send_work=%s",
+            _PP_OUTPUT_DEBUG_PREFIX,
+            self.ps.pp_rank,
+            self.ps.attn_tp_rank,
+            self.ps.attn_cp_rank,
+            next_first_rank_mb_id,
+            next_mb_id,
+            next_pp_outputs is not None,
+            d2h_event,
+            len(self.send_output_work),
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
@@ -1249,6 +1329,18 @@ class SchedulerPPMixin:
                     not target.forward_mode.is_prebuilt()
                     and not _pp_can_skip_output_comm(target)
                 ):
+                    logger.warning(
+                        "%s send begin: role=last-new-output pp_rank=%s "
+                        "tp_rank=%s cp_rank=%s target_mb=%s queue_len_before=%s "
+                        "keys=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_tp_rank,
+                        self.ps.attn_cp_rank,
+                        next_first_rank_mb_id,
+                        len(last_rank_comm_queue) + 1,
+                        sorted(pp_outputs_to_send.tensors.keys()),
+                    )
                     self.device_module.current_stream().wait_event(q_event)
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
@@ -1256,15 +1348,45 @@ class SchedulerPPMixin:
                             async_send=True,
                             msg_type="output",
                         )
+                    logger.warning(
+                        "%s send queued: role=last-new-output pp_rank=%s "
+                        "tp_rank=%s cp_rank=%s target_mb=%s work_count=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_tp_rank,
+                        self.ps.attn_cp_rank,
+                        next_first_rank_mb_id,
+                        len(send_output_work),
+                    )
         # send the outputs from the last round to let the next stage worker run post processing
         if not self.pp_group.is_last_rank:
             if pp_outputs:
+                logger.warning(
+                    "%s send begin: role=forward-old-output pp_rank=%s "
+                    "tp_rank=%s cp_rank=%s target_mb=%s keys=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_tp_rank,
+                    self.ps.attn_cp_rank,
+                    next_first_rank_mb_id,
+                    sorted(pp_outputs.tensors.keys()),
+                )
                 with torch.profiler.record_function("send_res_dict_to_next_stage"):
                     send_output_work = self._pp_send_dict_to_next_stage(
                         pp_outputs.tensors,
                         async_send=True,
                         msg_type="output",
                     )
+                logger.warning(
+                    "%s send queued: role=forward-old-output pp_rank=%s "
+                    "tp_rank=%s cp_rank=%s target_mb=%s work_count=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_tp_rank,
+                    self.ps.attn_cp_rank,
+                    next_first_rank_mb_id,
+                    len(send_output_work),
+                )
         return send_output_work
 
     def _pp_send_recv_and_preprocess_output_tensors(
@@ -1299,6 +1421,25 @@ class SchedulerPPMixin:
         # XPU: even ranks send first, odd ranks recv first.
         send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
 
+        logger.warning(
+            "%s send/recv plan: pp_rank=%s tp_rank=%s cp_rank=%s "
+            "next_first_mb=%s next_mb=%s send_first=%s is_last=%s "
+            "has_forward_output=%s send_target_exists=%s recv_target_exists=%s "
+            "last_queue_len=%s",
+            _PP_OUTPUT_DEBUG_PREFIX,
+            self.ps.pp_rank,
+            self.ps.attn_tp_rank,
+            self.ps.attn_cp_rank,
+            next_first_rank_mb_id,
+            next_mb_id,
+            send_first,
+            self.pp_group.is_last_rank,
+            pp_outputs is not None,
+            mbs[next_first_rank_mb_id] is not None,
+            mbs[next_mb_id] is not None,
+            len(last_rank_comm_queue),
+        )
+
         def _do_send():
             return self._pp_send_output_to_next_stage(
                 next_first_rank_mb_id,
@@ -1317,15 +1458,53 @@ class SchedulerPPMixin:
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
                 )
                 return
+            logger.warning(
+                "%s recv begin: pp_rank=%s tp_rank=%s cp_rank=%s "
+                "next_mb=%s",
+                _PP_OUTPUT_DEBUG_PREFIX,
+                self.ps.pp_rank,
+                self.ps.attn_tp_rank,
+                self.ps.attn_cp_rank,
+                next_mb_id,
+            )
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
+            logger.warning(
+                "%s recv returned: pp_rank=%s tp_rank=%s cp_rank=%s "
+                "next_mb=%s keys=%s",
+                _PP_OUTPUT_DEBUG_PREFIX,
+                self.ps.pp_rank,
+                self.ps.attn_tp_rank,
+                self.ps.attn_cp_rank,
+                next_mb_id,
+                sorted(next_pp_outputs.tensors.keys()),
+            )
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.schedule_stream)
+                logger.warning(
+                    "%s prep begin on copy stream: pp_rank=%s tp_rank=%s "
+                    "cp_rank=%s next_mb=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_tp_rank,
+                    self.ps.attn_cp_rank,
+                    next_mb_id,
+                )
                 batch_result = self._pp_prep_batch_result(
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
+                logger.warning(
+                    "%s prep queued and event recorded: pp_rank=%s tp_rank=%s "
+                    "cp_rank=%s next_mb=%s event=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_tp_rank,
+                    self.ps.attn_cp_rank,
+                    next_mb_id,
+                    d2h_event,
+                )
 
         if send_first:
             send_output_work = _do_send()

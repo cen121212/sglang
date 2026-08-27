@@ -653,7 +653,9 @@ class SchedulerPPMixin:
         ]
         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
         self.pp_outputs: Optional[PPProxyTensors] = None
-        self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
+        self.last_rank_comm_queue: deque[
+            Tuple[torch.Event, PPProxyTensors, bool]
+        ] = deque()
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -1338,7 +1340,6 @@ class SchedulerPPMixin:
         self: Scheduler,
         next_first_rank_mb_id: int,
         mbs: List[ScheduleBatch],
-        mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
         pp_outputs: PPProxyTensors | None,
     ) -> List[P2PWork]:
@@ -1347,12 +1348,14 @@ class SchedulerPPMixin:
             # send ready PP output to rank 0
             target = mbs[next_first_rank_mb_id]
             if target is not None:
-                q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
+                (
+                    q_event,
+                    pp_outputs_to_send,
+                    skip_output_comm,
+                ) = last_rank_comm_queue.popleft()
                 if (
                     not target.forward_mode.is_prebuilt()
-                    and not self._pp_should_skip_output_comm(
-                        mb_metadata[next_first_rank_mb_id]
-                    )
+                    and not skip_output_comm
                 ):
                     logger.warning(
                         "%s send begin: role=last-new-output pp_rank=%s "
@@ -1420,7 +1423,7 @@ class SchedulerPPMixin:
         next_mb_id: int,
         mbs: List[ScheduleBatch],
         mb_metadata: List[PPBatchMetadata],
-        last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
+        last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors, bool]],
         pp_outputs: PPProxyTensors | None,
     ) -> Tuple[
         Optional[PPProxyTensors],
@@ -1469,7 +1472,6 @@ class SchedulerPPMixin:
             return self._pp_send_output_to_next_stage(
                 next_first_rank_mb_id,
                 mbs,
-                mb_metadata,
                 last_rank_comm_queue,
                 pp_outputs,
             )
@@ -1549,9 +1551,8 @@ class SchedulerPPMixin:
             can_send_output = (
                 send_target is not None
                 and not send_target.forward_mode.is_prebuilt()
-                and not self._pp_should_skip_output_comm(
-                    mb_metadata[next_first_rank_mb_id]
-                )
+                and bool(last_rank_comm_queue)
+                and not last_rank_comm_queue[0][2]
             )
         else:
             can_send_output = pp_outputs is not None
@@ -1568,7 +1569,12 @@ class SchedulerPPMixin:
 
         if use_atomic_npu_exchange:
             if self.pp_group.is_last_rank:
-                q_event, output_to_send = last_rank_comm_queue.popleft()
+                (
+                    q_event,
+                    output_to_send,
+                    skip_output_comm,
+                ) = last_rank_comm_queue.popleft()
+                assert not skip_output_comm
                 self.device_module.current_stream().wait_event(q_event)
                 send_tensor_dict = output_to_send.tensors
                 send_role = "last-new-output"
@@ -1697,6 +1703,7 @@ class SchedulerPPMixin:
                             PPProxyTensors(
                                 self._pp_prepare_tensor_dict(result, cur_batch)
                             ),
+                            skip_output_comm,
                         )
                     )
         return result, event

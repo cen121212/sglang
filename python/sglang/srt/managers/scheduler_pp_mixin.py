@@ -271,19 +271,114 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
+                logger.warning(
+                    "%s loop begin: loop=disagg_prefill pp_rank=%s tp_rank=%s "
+                    "cp_rank=%s mb_id=%s next_first_mb=%s next_mb=%s "
+                    "mb_exists=%s next_mb_exists=%s bmb_exists=%s tmb_exists=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_tp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                    next_first_rank_mb_id,
+                    next_mb_id,
+                    self.mbs[mb_id] is not None,
+                    self.mbs[next_mb_id] is not None,
+                    bmbs[next_mb_id] is not None,
+                    tmbs[next_mb_id] is not None,
+                )
+
+                logger.warning(
+                    "%s frontend request recv begin: pp_rank=%s cp_rank=%s mb_id=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                )
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
+                logger.warning(
+                    "%s frontend request recv/process end: pp_rank=%s cp_rank=%s "
+                    "mb_id=%s req_count=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                    len(recv_reqs),
+                )
 
                 if not self.pp_group.is_last_rank:
+                    logger.warning(
+                        "%s request work commit begin: pp_rank=%s cp_rank=%s "
+                        "mb_id=%s pending_work=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        len(self.send_req_work),
+                    )
                     self._pp_commit_comm_work(self.send_req_work)
+                    logger.warning(
+                        "%s request work commit end: pp_rank=%s cp_rank=%s mb_id=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                    )
 
+                logger.warning(
+                    "%s bootstrap ids get begin: pp_rank=%s cp_rank=%s mb_id=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                )
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
                 bmbs[mb_id] = bootstrapped_rids
+                logger.warning(
+                    "%s bootstrap send work commit begin: pp_rank=%s cp_rank=%s "
+                    "mb_id=%s pending_work=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                    len(send_bootstrapped_work),
+                )
                 self._pp_commit_comm_work(send_bootstrapped_work)
+                logger.warning(
+                    "%s bootstrap ids/commit end: pp_rank=%s cp_rank=%s mb_id=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                )
 
+                logger.warning(
+                    "%s transferred ids get begin: pp_rank=%s cp_rank=%s mb_id=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                )
                 transferred_rids = self._pp_pd_get_prefill_transferred_ids()
+                logger.warning(
+                    "%s transfer send work commit begin: pp_rank=%s cp_rank=%s "
+                    "mb_id=%s pending_work=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                    len(send_transfer_work),
+                )
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
+                logger.warning(
+                    "%s transferred ids/commit end: pp_rank=%s cp_rank=%s mb_id=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                )
 
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
@@ -299,7 +394,25 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
+                    logger.warning(
+                        "%s proxy recv begin: pp_rank=%s cp_rank=%s mb_id=%s "
+                        "is_first=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        self.pp_group.is_first_rank,
+                    )
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    logger.warning(
+                        "%s proxy recv end: pp_rank=%s cp_rank=%s mb_id=%s "
+                        "has_proxy=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        pp_proxy_tensors is not None,
+                    )
 
                 if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -308,16 +421,46 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                logger.warning(
+                    "%s proxy work commit begin: pp_rank=%s cp_rank=%s mb_id=%s "
+                    "pending_work=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                    len(self.send_proxy_work),
+                )
                 self._pp_commit_comm_work(self.send_proxy_work)
+                logger.warning(
+                    "%s proxy work committed: pp_rank=%s cp_rank=%s mb_id=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                )
                 if cur_batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(cur_batch)
+                    logger.warning(
+                        "%s launch batch begin: pp_rank=%s cp_rank=%s mb_id=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                    )
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         cur_batch,
                         pp_proxy_tensors,
                         self.mb_metadata,
                         self.last_rank_comm_queue,
+                    )
+                    logger.warning(
+                        "%s launch batch returned: pp_rank=%s cp_rank=%s mb_id=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
                     )
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -326,6 +469,15 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                logger.warning(
+                    "%s bootstrap consensus send begin: pp_rank=%s cp_rank=%s "
+                    "mb_id=%s next_first_mb=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                    next_first_rank_mb_id,
+                )
                 send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
                     self._pp_pd_send_consensus_bootstrapped_ids(
                         bmbs,
@@ -334,23 +486,116 @@ class SchedulerPPMixin:
                         bootstrapped_rids,
                     )
                 )
+                logger.warning(
+                    "%s bootstrap consensus send end: pp_rank=%s cp_rank=%s mb_id=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                )
+                logger.warning(
+                    "%s release consensus send begin: pp_rank=%s cp_rank=%s "
+                    "mb_id=%s next_first_mb=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                    next_first_rank_mb_id,
+                )
                 send_release_work, release_rids = (
                     self._pp_pd_send_consensus_release_ids(
                         tmbs, next_first_rank_mb_id, release_rids, transferred_rids
                     )
                 )
+                logger.warning(
+                    "%s release consensus send end: pp_rank=%s cp_rank=%s mb_id=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                )
 
                 if bmbs[next_mb_id] is not None:
+                    logger.warning(
+                        "%s bootstrap consensus recv begin: pp_rank=%s cp_rank=%s "
+                        "mb_id=%s next_mb=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        next_mb_id,
+                    )
                     next_consensus_bootstrapped_rids = (
                         self._pp_recv_pyobj_from_prev_stage()
+                    )
+                    logger.warning(
+                        "%s bootstrap consensus recv end: pp_rank=%s cp_rank=%s "
+                        "mb_id=%s next_mb=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        next_mb_id,
                     )
                     next_consensus_bootstrapped_rids = self.process_bootstrapped_queue(
                         next_consensus_bootstrapped_rids
                     )
+                logger.warning(
+                    "%s bootstrap consensus work commit begin: pp_rank=%s "
+                    "cp_rank=%s mb_id=%s pending_work=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                    len(send_consensus_bootstrapped_work),
+                )
                 self._pp_commit_comm_work(send_consensus_bootstrapped_work)
+                logger.warning(
+                    "%s bootstrap consensus work commit end: pp_rank=%s "
+                    "cp_rank=%s mb_id=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                )
                 if tmbs[next_mb_id] is not None:
+                    logger.warning(
+                        "%s release consensus recv begin: pp_rank=%s cp_rank=%s "
+                        "mb_id=%s next_mb=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        next_mb_id,
+                    )
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                    logger.warning(
+                        "%s release consensus recv end: pp_rank=%s cp_rank=%s "
+                        "mb_id=%s next_mb=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        next_mb_id,
+                    )
+                logger.warning(
+                    "%s release consensus work commit begin: pp_rank=%s "
+                    "cp_rank=%s mb_id=%s pending_work=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                    len(send_release_work),
+                )
                 self._pp_commit_comm_work(send_release_work)
+                logger.warning(
+                    "%s release consensus work commit end: pp_rank=%s "
+                    "cp_rank=%s mb_id=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                )
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     logger.warning(
@@ -375,15 +620,62 @@ class SchedulerPPMixin:
                         mb_id,
                         next_mb_id,
                     )
+                    logger.warning(
+                        "%s process batch result begin: pp_rank=%s cp_rank=%s "
+                        "mb_id=%s processed_mb=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        next_mb_id,
+                    )
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,
                     )
+                    logger.warning(
+                        "%s process batch result end: pp_rank=%s cp_rank=%s "
+                        "mb_id=%s processed_mb=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        next_mb_id,
+                    )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if tmbs[next_mb_id] is not None:
+                    logger.warning(
+                        "%s inflight process begin: pp_rank=%s cp_rank=%s "
+                        "mb_id=%s next_mb=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        next_mb_id,
+                    )
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
+                    logger.warning(
+                        "%s inflight process end: pp_rank=%s cp_rank=%s "
+                        "mb_id=%s next_mb=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        next_mb_id,
+                    )
                 if not self.pp_group.is_last_rank:
+                    logger.warning(
+                        "%s downstream metadata send begin: pp_rank=%s cp_rank=%s "
+                        "mb_id=%s req_count=%s bootstrap_count=%s transfer_count=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                        len(recv_reqs),
+                        len(bootstrapped_rids),
+                        len(transferred_rids),
+                    )
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
@@ -393,14 +685,46 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
+                    logger.warning(
+                        "%s downstream metadata send queued: pp_rank=%s cp_rank=%s "
+                        "mb_id=%s",
+                        _PP_OUTPUT_DEBUG_PREFIX,
+                        self.ps.pp_rank,
+                        self.ps.attn_cp_rank,
+                        mb_id,
+                    )
                     if cur_batch:
+                        logger.warning(
+                            "%s proxy send wait launch begin: pp_rank=%s cp_rank=%s "
+                            "mb_id=%s",
+                            _PP_OUTPUT_DEBUG_PREFIX,
+                            self.ps.pp_rank,
+                            self.ps.attn_cp_rank,
+                            mb_id,
+                        )
                         self.device_module.current_stream().wait_event(
                             self.launch_event
+                        )
+                        logger.warning(
+                            "%s proxy send begin: pp_rank=%s cp_rank=%s mb_id=%s",
+                            _PP_OUTPUT_DEBUG_PREFIX,
+                            self.ps.pp_rank,
+                            self.ps.attn_cp_rank,
+                            mb_id,
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
                             msg_type="proxy",
+                        )
+                        logger.warning(
+                            "%s proxy send queued: pp_rank=%s cp_rank=%s mb_id=%s "
+                            "work_count=%s",
+                            _PP_OUTPUT_DEBUG_PREFIX,
+                            self.ps.pp_rank,
+                            self.ps.attn_cp_rank,
+                            mb_id,
+                            len(self.send_proxy_work),
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -408,6 +732,15 @@ class SchedulerPPMixin:
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
 
                 self.running_batch.batch_is_full = False
+                logger.warning(
+                    "%s loop iteration end: loop=disagg_prefill pp_rank=%s "
+                    "cp_rank=%s mb_id=%s next_mb=%s",
+                    _PP_OUTPUT_DEBUG_PREFIX,
+                    self.ps.pp_rank,
+                    self.ps.attn_cp_rank,
+                    mb_id,
+                    next_mb_id,
+                )
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:

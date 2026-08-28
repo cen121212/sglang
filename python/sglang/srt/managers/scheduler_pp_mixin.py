@@ -1348,14 +1348,12 @@ class SchedulerPPMixin:
             # send ready PP output to rank 0
             target = mbs[next_first_rank_mb_id]
             if target is not None:
-                (
-                    q_event,
-                    pp_outputs_to_send,
-                    skip_output_comm,
-                ) = last_rank_comm_queue.popleft()
+                q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
                 if (
                     not target.forward_mode.is_prebuilt()
-                    and not skip_output_comm
+                    and not bool(
+                        getattr(target, "_pp_skip_output_comm", False)
+                    )
                 ):
                     logger.warning(
                         "%s send begin: role=last-new-output pp_rank=%s "
@@ -1423,7 +1421,7 @@ class SchedulerPPMixin:
         next_mb_id: int,
         mbs: List[ScheduleBatch],
         mb_metadata: List[PPBatchMetadata],
-        last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors, bool]],
+        last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
         pp_outputs: PPProxyTensors | None,
     ) -> Tuple[
         Optional[PPProxyTensors],
@@ -1552,7 +1550,9 @@ class SchedulerPPMixin:
                 send_target is not None
                 and not send_target.forward_mode.is_prebuilt()
                 and bool(last_rank_comm_queue)
-                and not last_rank_comm_queue[0][2]
+                and not bool(
+                    getattr(send_target, "_pp_skip_output_comm", False)
+                )
             )
         else:
             can_send_output = pp_outputs is not None
@@ -1572,9 +1572,7 @@ class SchedulerPPMixin:
                 (
                     q_event,
                     output_to_send,
-                    skip_output_comm,
                 ) = last_rank_comm_queue.popleft()
-                assert not skip_output_comm
                 self.device_module.current_stream().wait_event(q_event)
                 send_tensor_dict = output_to_send.tensors
                 send_role = "last-new-output"
@@ -1693,6 +1691,12 @@ class SchedulerPPMixin:
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     skip_output_comm=skip_output_comm,
                 )
+                # The mb_metadata list is a reused ring.  Keep the synchronized
+                # output-communication decision on the batch object as well so
+                # a delayed last-rank send reads the decision belonging to its
+                # actual send target, not a subsequently overwritten slot or a
+                # FIFO output produced for a different pipeline slot.
+                cur_batch._pp_skip_output_comm = skip_output_comm
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
                 if self.pp_group.is_last_rank:
@@ -1703,7 +1707,6 @@ class SchedulerPPMixin:
                             PPProxyTensors(
                                 self._pp_prepare_tensor_dict(result, cur_batch)
                             ),
-                            skip_output_comm,
                         )
                     )
         return result, event

@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 _PP_OUTPUT_DEBUG_PREFIX = "[PP-OUTPUT-DEBUG]"
 _PP_SKIP_OUTPUT_COMM_KEY = "__skip_output_comm__"
+_PP_SKIPPED_OUTPUT_KEY = "__skipped_output__"
 
 
 def _pp_debug_query_async_obj(obj):
@@ -1349,28 +1350,33 @@ class SchedulerPPMixin:
             target = mbs[next_first_rank_mb_id]
             if target is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if (
-                    not target.forward_mode.is_prebuilt()
-                    and not bool(
+                if not target.forward_mode.is_prebuilt():
+                    skip_payload = bool(
                         getattr(target, "_pp_skip_output_comm", False)
                     )
-                ):
+                    tensor_dict_to_send = (
+                        {_PP_SKIPPED_OUTPUT_KEY: True}
+                        if skip_payload
+                        else pp_outputs_to_send.tensors
+                    )
                     logger.warning(
                         "%s send begin: role=last-new-output pp_rank=%s "
-                        "tp_rank=%s cp_rank=%s target_mb=%s queue_len_before=%s "
-                        "keys=%s",
+                        "tp_rank=%s cp_rank=%s target_mb=%s skip_payload=%s "
+                        "queue_len_before=%s keys=%s",
                         _PP_OUTPUT_DEBUG_PREFIX,
                         self.ps.pp_rank,
                         self.ps.attn_tp_rank,
                         self.ps.attn_cp_rank,
                         next_first_rank_mb_id,
+                        skip_payload,
                         len(last_rank_comm_queue) + 1,
-                        sorted(pp_outputs_to_send.tensors.keys()),
+                        sorted(tensor_dict_to_send.keys()),
                     )
-                    self.device_module.current_stream().wait_event(q_event)
+                    if not skip_payload:
+                        self.device_module.current_stream().wait_event(q_event)
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
-                            pp_outputs_to_send.tensors,
+                            tensor_dict_to_send,
                             async_send=True,
                             msg_type="output",
                         )
@@ -1488,6 +1494,14 @@ class SchedulerPPMixin:
                 next_mb_id,
                 sorted(next_pp_outputs.tensors.keys()),
             )
+            if bool(tensor_dict.get(_PP_SKIPPED_OUTPUT_KEY, False)):
+                _, batch_result, d2h_event = self._pp_make_skip_output_result(
+                    target, mb_metadata[next_mb_id]
+                )
+                # Keep the marker alive so intermediate PP ranks forward the
+                # same output slot without materializing the skipped payload.
+                next_pp_outputs = PPProxyTensors({_PP_SKIPPED_OUTPUT_KEY: True})
+                return
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.schedule_stream)
                 logger.warning(
@@ -1525,11 +1539,6 @@ class SchedulerPPMixin:
             target = mbs[next_mb_id]
             if target is None or target.forward_mode.is_prebuilt():
                 return
-            if self._pp_should_skip_output_comm(mb_metadata[next_mb_id]):
-                next_pp_outputs, batch_result, d2h_event = (
-                    self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
-                )
-                return
             logger.warning(
                 "%s recv begin: pp_rank=%s tp_rank=%s cp_rank=%s "
                 "next_mb=%s",
@@ -1550,16 +1559,12 @@ class SchedulerPPMixin:
                 send_target is not None
                 and not send_target.forward_mode.is_prebuilt()
                 and bool(last_rank_comm_queue)
-                and not bool(
-                    getattr(send_target, "_pp_skip_output_comm", False)
-                )
             )
         else:
             can_send_output = pp_outputs is not None
         can_recv_output = (
             recv_target is not None
             and not recv_target.forward_mode.is_prebuilt()
-            and not self._pp_should_skip_output_comm(mb_metadata[next_mb_id])
         )
         use_atomic_npu_exchange = (
             is_npu()
@@ -1573,8 +1578,14 @@ class SchedulerPPMixin:
                     q_event,
                     output_to_send,
                 ) = last_rank_comm_queue.popleft()
-                self.device_module.current_stream().wait_event(q_event)
-                send_tensor_dict = output_to_send.tensors
+                skip_payload = bool(
+                    getattr(send_target, "_pp_skip_output_comm", False)
+                )
+                if skip_payload:
+                    send_tensor_dict = {_PP_SKIPPED_OUTPUT_KEY: True}
+                else:
+                    self.device_module.current_stream().wait_event(q_event)
+                    send_tensor_dict = output_to_send.tensors
                 send_role = "last-new-output"
             else:
                 send_tensor_dict = pp_outputs.tensors

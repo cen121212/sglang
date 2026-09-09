@@ -5725,6 +5725,24 @@ def configure_scheduler_process(
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
 
+    if _is_npu:
+        # Keep NPU workers from concurrently publishing the same Triton launcher.
+        cache_root = os.path.expanduser(
+            os.environ.get(
+                "TRITON_CACHE_DIR",
+                os.path.join(envs.SGLANG_CACHE_DIR.get(), "triton"),
+            )
+        )
+        cache_dp_rank = shown_dp if shown_dp is not None else 0
+        cache_dir = os.path.join(
+            cache_root,
+            f"dp_{cache_dp_rank}",
+            f"tp_{shown_tp}_pp_{pp_rank}",
+        )
+        os.makedirs(cache_dir, exist_ok=True)
+        os.environ["TRITON_CACHE_DIR"] = cache_dir
+        logger.info("Scheduler TRITON_CACHE_DIR=%s", cache_dir)
+
     # Set cpu affinity to this gpu process
     if envs.SGLANG_SET_CPU_AFFINITY.get():
         set_gpu_proc_affinity(

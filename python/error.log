@@ -1,0 +1,30 @@
+[RUN] decode-partial-page, dtype=torch.float16
+[1/2] c++ -MMD -MF flash_mla_with_kvcache.o.d -DTORCH_EXTENSION_NAME=flash_mla_with_kvcache -DTORCH_API_INCLUDE_EXTENSION_H -I/mnt/share/l00890003/codes/sglang/kimi-k3/vendors/custom_transformer/op_api/include -I/mnt/share/l00890003/codes/sglang/kimi-k3/vendors/custom_transformer/op_api/include -I/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/include -I/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/include/third_party/hccl/inc -I/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/include/third_party/acl/inc -I/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/include/third_party/op-plugin -I/usr/local/Ascend/cann-9.2.0/include -I/usr/local/Ascend/cann-9.2.0/include/aclnnop -I/usr/local/python3.12.13/lib/python3.12/site-packages/cann_ops_transformer/common -isystem /usr/local/python3.12.13/lib/python3.12/site-packages/torch/include -isystem /usr/local/python3.12.13/lib/python3.12/site-packages/torch/include/torch/csrc/api/include -isystem /usr/local/python3.12.13/include/python3.12 -fPIC -std=c++17 -O3 -w -fPIC -fstack-protector-all -Wl,-z,relro,-z,now,-z,noexecstack -pie -s -fvisibility=hidden -D_FORTIFY_SOURCE=2 -D_GLIBCXX_USE_CXX11_ABI=1 -c /usr/local/python3.12.13/lib/python3.12/site-packages/cann_ops_transformer/csrc/attention/flash_mla_with_kvcache.cpp -o flash_mla_with_kvcache.o 
+[2/2] c++ flash_mla_with_kvcache.o -shared -L/mnt/share/l00890003/codes/sglang/kimi-k3/vendors/custom_transformer/op_api/lib -L/mnt/share/l00890003/codes/sglang/kimi-k3/vendors/custom_transformer/op_api/lib -L/usr/local/Ascend/cann-9.2.0/lib64 -lascendcl -L/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/lib -ltorch_npu -L/usr/local/python3.12.13/lib/python3.12/site-packages/torch/lib -lc10 -ltorch_cpu -ltorch -ltorch_python -o flash_mla_with_kvcache.so
+[FAIL] decode-partial-page, dtype=torch.float16
+Traceback (most recent call last):
+  File "/home/luochen/sglang/test/manual/attention/test_npu_flash_mla_with_kvcache.py", line 210, in <module>
+    main()
+  File "/home/luochen/sglang/test/manual/attention/test_npu_flash_mla_with_kvcache.py", line 198, in main
+    test_flash_mla_matches_fia_v2(
+  File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/luochen/sglang/test/manual/attention/test_npu_flash_mla_with_kvcache.py", line 151, in test_flash_mla_matches_fia_v2
+    mla_output, _ = flash_mla_with_kvcache(
+                    ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_ops.py", line 1209, in __call__
+    return self._op(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.12.13/lib/python3.12/site-packages/cann_ops_transformer/ops/attention/flash_mla_with_kvcache/flash_mla_with_kvcache.py", line 268, in flash_mla_with_kvcache
+    return op_module.flash_mla_with_kvcache(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: call aclnnFlashMlaWithKvcache failed, detail:[PID: 56967] 2026-09-16-08:47:32.071.857 Invalid_Argument_Tensor_Dtype(EZ0019): Parameter attn_mask of FlashMlaWithKvcache has incorrect dtype DT_BOOL. It should be INT8.
+        Solution: Check whether the dtype of input/output tensor is correct.
+TraceBack (most recent call last):
+        Failed to execute operator FlashMlaWithKvcache_0. Reason: Failed to execute tiling function.
+        Check NnopbaseExecutorDoTiling(executor) failed
+        Check NnopbaseExecutorTilingAndUpdateBinInfo(executor) failed
+        Check NnopbaseExecutorMatchCache(executor) failed
+        Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
+

@@ -3,7 +3,12 @@
 From the sglang repository, with torch, torch_npu and the matching
 CANN/custom-op libraries installed:
 
-    python test/manual/attention/test_npu_flash_mla_with_kvcache.py
+    python test/manual/attention/test_npu_flash_mla_with_kvcache.py --tp-size 8
+
+Total Query heads are 96. --tp-size selects 1/2/4/8 (default: 1), so each
+operator runs with 96/48/24/12 local Query heads and one replicated KV head.
+This is a single-device comparison of one TP rank's operator geometry; it
+does not launch distributed workers or test TP communication.
 
 If cann_ops_transformer is not installed, the unpacked package under the
 repository's python directory is used automatically.
@@ -14,9 +19,24 @@ lengths include the current query tokens. Only attention output is compared;
 the source call discards LSE. Missing dependencies or a failed case exit nonzero.
 """
 
+import argparse
 import importlib.util
 import sys
 from pathlib import Path
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--tp-size", "--tp_size", type=int, choices=(1, 2, 4, 8), default=1,
+        help="Tensor parallel size; local Query heads = 96 / tp_size (default: 1)",
+    )
+    return parser.parse_args()
+
+
+# Parse before loading NPU dependencies so --help works on any machine.
+if __name__ == "__main__":
+    args = parse_args()
 
 try:
     import torch
@@ -43,6 +63,7 @@ from cann_ops_transformer.ops.attention.flash_mla_with_kvcache import (
 )
 
 
+HEAD_NUM = 96
 HEAD_DIM_V = 512
 HEAD_DIM_ROPE = 64
 PAGE_SIZE = 128
@@ -186,16 +207,25 @@ def test_flash_mla_matches_fia_v2(dtype, query_len, kv_lengths, num_heads):
     _assert_close(mla, expected, label="Flash MLA vs FP32", atol=atol, rtol=rtol)
 
 
-def main():
+def main(tp_size):
+    num_heads = HEAD_NUM // tp_size
+    print(
+        f"Single-rank operator comparison: head_num={HEAD_NUM}, "
+        f"tp_size={tp_size}, local_query_heads={num_heads}, kv_heads=1",
+        flush=True,
+    )
     cases = [
-        ("decode-partial-page", 1, (129,), 16),
-        ("verify-mixed-lengths", 4, (128, 257), 16),
-        ("verify-no-prefix-and-multi-page", 8, (8, 127, 513), 32),
+        ("decode-partial-page", 1, (129,)),
+        ("verify-mixed-lengths", 4, (128, 257)),
+        ("verify-no-prefix-and-multi-page", 8, (8, 127, 513)),
     ]
     passed = 0
     for dtype in (torch.float16, torch.bfloat16):
-        for name, query_len, kv_lengths, num_heads in cases:
-            label = f"{name}, dtype={dtype}"
+        for name, query_len, kv_lengths in cases:
+            label = (
+                f"{name}, dtype={dtype}, tp_size={tp_size}, "
+                f"local_query_heads={num_heads}"
+            )
             print(f"\n[RUN] {label}", flush=True)
             try:
                 test_flash_mla_matches_fia_v2(
@@ -210,4 +240,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(args.tp_size)

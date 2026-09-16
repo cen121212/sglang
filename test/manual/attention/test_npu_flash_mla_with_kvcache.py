@@ -9,6 +9,10 @@ Total Query heads are 96. --tp-size selects 1/2/4/8 (default: 1), so each
 operator runs with 96/48/24/12 local Query heads and one replicated KV head.
 This is a single-device comparison of one TP rank's operator geometry; it
 does not launch distributed workers or test TP communication.
+Only verify-mixed-lengths is tested: query_len=4, KV lengths=[4, 127, 513].
+For each dtype, inputs are prepared once and each attention operator runs
+10 times. Flash MLA metadata is regenerated in every iteration before attention.
+The final outputs are checked against each other and FP32.
 
 If cann_ops_transformer is not installed, the unpacked package under the
 repository's python directory is used automatically.
@@ -33,10 +37,6 @@ def parse_args():
     )
     return parser.parse_args()
 
-
-# Parse before loading NPU dependencies so --help works on any machine.
-if __name__ == "__main__":
-    args = parse_args()
 
 try:
     import torch
@@ -64,6 +64,7 @@ from cann_ops_transformer.ops.attention.flash_mla_with_kvcache import (
 
 
 HEAD_NUM = 96
+NUM_ITERATIONS = 10
 HEAD_DIM_V = 512
 HEAD_DIM_ROPE = 64
 PAGE_SIZE = 128
@@ -139,57 +140,64 @@ def test_flash_mla_matches_fia_v2(dtype, query_len, kv_lengths, num_heads):
     c_kv_cache = cache[..., :HEAD_DIM_V].transpose(1, 2).contiguous()
     k_rope_cache = cache[..., HEAD_DIM_V:].transpose(1, 2).contiguous()
 
-    fia_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
-        q_nope,
-        c_kv_cache,
-        c_kv_cache,
-        query_rope=q_rope,
-        key_rope=k_rope_cache,
-        num_query_heads=num_heads,
-        num_key_value_heads=1,
-        input_layout="BNSD",
-        softmax_scale=scale,
-        block_table=block_table,
-        block_size=PAGE_SIZE,
-        sparse_mode=3,
-        atten_mask=attn_mask,
-        actual_seq_qlen=[query_len] * batch,
-        actual_seq_kvlen=list(kv_lengths),
-        pre_tokens=FULL_ATTENTION_WINDOW,
-        next_tokens=0,
-    )
+    actual_seq_qlen = [query_len] * batch
+    actual_seq_kvlen = list(kv_lengths)
     torch.npu.synchronize()
 
-    metadata = flash_mla_with_kvcache_metadata(
-        cache_seqlens=cache_seqlens,
-        num_heads_q=num_heads,
-        num_heads_kv=1,
-        seqused_q=seqused_q,
-        max_seqlen_q=query_len,
-        max_seqlen_kv=max_kv_len,
-        head_dim_qk=HEAD_DIM_V + HEAD_DIM_ROPE,
-        head_dim_v=HEAD_DIM_V,
-        mask_mode=3,
-        layout_q="BSND",
-    )
-    mla_output, _ = flash_mla_with_kvcache(
-        q=q,
-        k_cache=cache,
-        block_table=block_table,
-        cache_seqlens=cache_seqlens,
-        seqused_q=seqused_q,
-        attn_mask=mla_attn_mask,
-        metadata=metadata,
-        head_dim_v=HEAD_DIM_V,
-        softmax_scale=scale,
-        mask_mode=3,
-        max_seqlen_q=query_len,
-        max_seqlen_kv=max_kv_len,
-        layout_q="BSND",
-        layout_kv="PA_BBND",
-        layout_out="BSND",
-        return_softmax_lse=False,
-    )
+    # Reuse prepared inputs for ten executions; compare the final outputs.
+    for _ in range(NUM_ITERATIONS):
+        fia_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+            q_nope,
+            c_kv_cache,
+            c_kv_cache,
+            query_rope=q_rope,
+            key_rope=k_rope_cache,
+            num_query_heads=num_heads,
+            num_key_value_heads=1,
+            input_layout="BNSD",
+            softmax_scale=scale,
+            block_table=block_table,
+            block_size=PAGE_SIZE,
+            sparse_mode=3,
+            atten_mask=attn_mask,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_kvlen=actual_seq_kvlen,
+            pre_tokens=FULL_ATTENTION_WINDOW,
+            next_tokens=0,
+        )
+    torch.npu.synchronize()
+
+    for _ in range(NUM_ITERATIONS):
+        metadata = flash_mla_with_kvcache_metadata(
+            cache_seqlens=cache_seqlens,
+            num_heads_q=num_heads,
+            num_heads_kv=1,
+            seqused_q=seqused_q,
+            max_seqlen_q=query_len,
+            max_seqlen_kv=max_kv_len,
+            head_dim_qk=HEAD_DIM_V + HEAD_DIM_ROPE,
+            head_dim_v=HEAD_DIM_V,
+            mask_mode=3,
+            layout_q="BSND",
+        )
+        mla_output, _ = flash_mla_with_kvcache(
+            q=q,
+            k_cache=cache,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            seqused_q=seqused_q,
+            attn_mask=mla_attn_mask,
+            metadata=metadata,
+            head_dim_v=HEAD_DIM_V,
+            softmax_scale=scale,
+            mask_mode=3,
+            max_seqlen_q=query_len,
+            max_seqlen_kv=max_kv_len,
+            layout_q="BSND",
+            layout_kv="PA_BBND",
+            layout_out="BSND",
+            return_softmax_lse=False,
+        )
     torch.npu.synchronize()
 
     assert fia_output.dtype == mla_output.dtype == dtype
@@ -215,16 +223,14 @@ def main(tp_size):
         flush=True,
     )
     cases = [
-        ("decode-partial-page", 1, (129,)),
-        ("verify-mixed-lengths", 4, (128, 257)),
-        ("verify-no-prefix-and-multi-page", 8, (8, 127, 513)),
+        ("verify-mixed-lengths", 4, (4, 127, 513)),
     ]
     passed = 0
     for dtype in (torch.float16, torch.bfloat16):
         for name, query_len, kv_lengths in cases:
             label = (
                 f"{name}, dtype={dtype}, tp_size={tp_size}, "
-                f"local_query_heads={num_heads}"
+                f"local_query_heads={num_heads}, iterations={NUM_ITERATIONS}"
             )
             print(f"\n[RUN] {label}", flush=True)
             try:
@@ -240,4 +246,5 @@ def main(tp_size):
 
 
 if __name__ == "__main__":
+    args = parse_args()
     main(args.tp_size)

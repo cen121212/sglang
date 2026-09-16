@@ -1,23 +1,40 @@
 """Compare the target-verify FIA v2 call with CANN Flash MLA on an Ascend NPU.
 
-From the sglang repository, with torch, torch_npu, pytest and the matching
+From the sglang repository, with torch, torch_npu and the matching
 CANN/custom-op libraries installed:
 
-    PYTHONPATH=python/cann_ops_transformer-1.0.0-py3-none-any:$PYTHONPATH \
-        python -m pytest -v -s test/manual/attention/test_npu_flash_mla_with_kvcache.py
+    python test/manual/attention/test_npu_flash_mla_with_kvcache.py
+
+If cann_ops_transformer is not installed, the unpacked package under the
+repository's python directory is used automatically.
 
 The source call is hardware_backend/npu/attention/ascend_backend.py:2374.
 This tests its ND paged-cache path (not PA_NZ or quantized caches). All KV
 lengths include the current query tokens. Only attention output is compared;
-the source call discards LSE. Missing NPU dependencies produce a skip, not a pass.
+the source call discards LSE. Missing dependencies or a failed case exit nonzero.
 """
 
-import pytest
+import importlib.util
+import sys
+from pathlib import Path
 
-torch = pytest.importorskip("torch")
-torch_npu = pytest.importorskip("torch_npu")
+try:
+    import torch
+    import torch_npu
+except ImportError as exc:
+    raise SystemExit(f"Required NPU dependency could not be loaded: {exc}") from exc
 if not torch.npu.is_available():
-    pytest.skip("An Ascend NPU is required", allow_module_level=True)
+    raise SystemExit("An Ascend NPU is required to run this comparison.")
+
+if importlib.util.find_spec("cann_ops_transformer") is None:
+    package_dir = (
+        Path(__file__).resolve().parents[3]
+        / "python"
+        / "cann_ops_transformer-1.0.0-py3-none-any"
+    )
+    if not (package_dir / "cann_ops_transformer").is_dir():
+        raise SystemExit("Install cann_ops_transformer before running this script.")
+    sys.path.insert(0, str(package_dir))
 
 # Once an NPU is present, package/operator loading errors must fail the test.
 from cann_ops_transformer.ops.attention.flash_mla_with_kvcache import (
@@ -64,15 +81,6 @@ def _assert_close(actual, expected, *, label, atol, rtol):
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(
-    "query_len,kv_lengths,num_heads",
-    [
-        pytest.param(1, (129,), 16, id="decode-partial-page"),
-        pytest.param(4, (128, 257), 16, id="verify-mixed-lengths"),
-        pytest.param(8, (8, 127, 513), 32, id="verify-no-prefix-and-multi-page"),
-    ],
-)
 @torch.inference_mode()
 def test_flash_mla_matches_fia_v2(dtype, query_len, kv_lengths, num_heads):
     # Build on CPU for a reproducible reference using the exact rounded inputs.
@@ -173,3 +181,30 @@ def test_flash_mla_matches_fia_v2(dtype, query_len, kv_lengths, num_heads):
     _assert_close(mla, fia, label="Flash MLA vs FIA v2", atol=atol, rtol=rtol)
     _assert_close(fia, expected, label="FIA v2 vs FP32", atol=atol, rtol=rtol)
     _assert_close(mla, expected, label="Flash MLA vs FP32", atol=atol, rtol=rtol)
+
+
+def main():
+    cases = [
+        ("decode-partial-page", 1, (129,), 16),
+        ("verify-mixed-lengths", 4, (128, 257), 16),
+        ("verify-no-prefix-and-multi-page", 8, (8, 127, 513), 32),
+    ]
+    passed = 0
+    for dtype in (torch.float16, torch.bfloat16):
+        for name, query_len, kv_lengths, num_heads in cases:
+            label = f"{name}, dtype={dtype}"
+            print(f"\n[RUN] {label}", flush=True)
+            try:
+                test_flash_mla_matches_fia_v2(
+                    dtype, query_len, kv_lengths, num_heads
+                )
+            except Exception:
+                print(f"[FAIL] {label}", file=sys.stderr, flush=True)
+                raise
+            passed += 1
+            print(f"[PASS] {label}", flush=True)
+    print(f"\nAll {passed} cases passed.", flush=True)
+
+
+if __name__ == "__main__":
+    main()

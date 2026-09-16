@@ -109,6 +109,9 @@ def test_flash_mla_matches_fia_v2(dtype, query_len, kv_lengths, num_heads):
     seqused_q = torch.full((batch,), query_len, dtype=torch.int32, device=device)
     # Same compressed causal-mask convention as AscendAttentionBackend.mtp_mask.
     attn_mask = torch.ones(2048, 2048, dtype=torch.bool).triu_(1).to(device)
+    # Flash MLA requires INT8; FIA v2 uses BOOL. Casting preserves the same
+    # mask values (0 = visible, 1 = masked) without changing causal alignment.
+    mla_attn_mask = attn_mask.to(dtype=torch.int8)
 
     q_nope = q[..., :HEAD_DIM_V].transpose(1, 2).contiguous()
     q_rope = q[..., HEAD_DIM_V:].transpose(1, 2).contiguous()
@@ -154,7 +157,7 @@ def test_flash_mla_matches_fia_v2(dtype, query_len, kv_lengths, num_heads):
         block_table=block_table,
         cache_seqlens=cache_seqlens,
         seqused_q=seqused_q,
-        attn_mask=attn_mask,
+        attn_mask=mla_attn_mask,
         metadata=metadata,
         head_dim_v=HEAD_DIM_V,
         softmax_scale=scale,

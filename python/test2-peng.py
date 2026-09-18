@@ -1,26 +1,11 @@
-"""Compare the target-verify FIA v2 call with CANN Flash MLA on an Ascend NPU.
+"""Compare FIA v2 and Flash MLA using NZ paged KV caches.
 
-From the sglang repository, with torch, torch_npu and the matching
-CANN/custom-op libraries installed:
-
-    python test/manual/attention/test_npu_flash_mla_with_kvcache.py --tp-size 8
-
-Total Query heads are 96. --tp-size selects 1/2/4/8 (default: 1), so each
-operator runs with 96/48/24/12 local Query heads and one replicated KV head.
-This is a single-device comparison of one TP rank's operator geometry; it
-does not launch distributed workers or test TP communication.
-Only verify-mixed-lengths is tested: query_len=4, KV lengths=[4, 127, 513].
-For each dtype, inputs are prepared once and each attention operator runs
-10 times. Flash MLA metadata is regenerated in every iteration before attention.
-The final outputs are checked against each other and FP32.
-
-If cann_ops_transformer is not installed, the unpacked package under the
-repository's python directory is used automatically.
-
-The source call is hardware_backend/npu/attention/ascend_backend.py:2374.
-This tests its ND paged-cache path (not PA_NZ or quantized caches). All KV
-lengths include the current query tokens. Only attention output is compared;
-the source call discards LSE. Missing dependencies or a failed case exit nonzero.
+Run from the sglang repository: python python/test2-peng.py
+Requires Ascend 950, matching CANN/custom ops, torch and torch_npu.
+Flash MLA follows the current documented TND / PA_NZ / NTD contract.
+Both operators use the original Query head count of each case.
+Each attention operator runs ten times; MLA metadata is regenerated each time.
+The CPU FP32 reference uses the original logical ND tensors.
 """
 
 import argparse
@@ -48,8 +33,7 @@ if not torch.npu.is_available():
 
 if importlib.util.find_spec("cann_ops_transformer") is None:
     package_dir = (
-        Path(__file__).resolve().parents[3]
-        / "python"
+        Path(__file__).resolve().parent
         / "cann_ops_transformer-1.0.0-py3-none-any"
     )
     if not (package_dir / "cann_ops_transformer").is_dir():
@@ -69,6 +53,22 @@ HEAD_DIM_V = 512
 HEAD_DIM_ROPE = 64
 PAGE_SIZE = 128
 FULL_ATTENTION_WINDOW = 2147483647
+
+
+def _to_pa_nz(cache):
+    """Pack BBND into [blocks, heads, D/16, page_size, 16].
+
+    A reshape alone does not convert ND storage to NZ; contiguous after the
+    permutation materializes the tile-major order required by both kernels.
+    """
+    blocks, page_size, heads, dim = cache.shape
+    if dim % 16:
+        raise ValueError(f"NZ head dimension must be divisible by 16, got {dim}")
+    return (
+        cache.reshape(blocks, page_size, heads, dim // 16, 16)
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
 
 
 def _reference(q, cache, block_table, kv_lengths, scale):
@@ -126,6 +126,18 @@ def test_flash_mla_matches_fia_v2(dtype, query_len, kv_lengths, num_heads):
     device = torch.device("npu", torch.npu.current_device())
     q = q_cpu.to(device)
     cache = cache_cpu.to(device)
+    # Flash MLA consumes merged 576-wide NZ; FIA consumes separate NZ caches.
+    cache_nz = _to_pa_nz(cache)
+    q_mla = q.reshape(batch * query_len, num_heads, HEAD_DIM_V + HEAD_DIM_ROPE)
+    q_mla = q_mla.contiguous()
+    cu_seqlens_q = torch.arange(
+        0, (batch + 1) * query_len, query_len, dtype=torch.int32, device=device
+    )
+    print(
+        f"FIA heads={num_heads}, Flash MLA heads={num_heads}, "
+        f"q(TND)={tuple(q_mla.shape)}, cache(PA_NZ)={tuple(cache_nz.shape)}",
+        flush=True,
+    )
     block_table = table_cpu.to(device)
     cache_seqlens = torch.tensor(kv_lengths, dtype=torch.int32, device=device)
     seqused_q = torch.full((batch,), query_len, dtype=torch.int32, device=device)
@@ -137,8 +149,9 @@ def test_flash_mla_matches_fia_v2(dtype, query_len, kv_lengths, num_heads):
 
     q_nope = q[..., :HEAD_DIM_V].transpose(1, 2).contiguous()
     q_rope = q[..., HEAD_DIM_V:].transpose(1, 2).contiguous()
-    c_kv_cache = cache[..., :HEAD_DIM_V].transpose(1, 2).contiguous()
-    k_rope_cache = cache[..., HEAD_DIM_V:].transpose(1, 2).contiguous()
+    c_kv_cache = _to_pa_nz(cache[..., :HEAD_DIM_V])
+    k_rope_cache = _to_pa_nz(cache[..., HEAD_DIM_V:])
+    del cache  # The kernels now use the three packed NZ tensors.
 
     actual_seq_qlen = [query_len] * batch
     actual_seq_kvlen = list(kv_lengths)
@@ -173,29 +186,31 @@ def test_flash_mla_matches_fia_v2(dtype, query_len, kv_lengths, num_heads):
             num_heads_q=num_heads,
             num_heads_kv=1,
             seqused_q=seqused_q,
-            max_seqlen_q=query_len,
-            max_seqlen_kv=max_kv_len,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=-1,
+            max_seqlen_kv=-1,
             head_dim_qk=HEAD_DIM_V + HEAD_DIM_ROPE,
             head_dim_v=HEAD_DIM_V,
             mask_mode=3,
-            layout_q="BSND",
+            layout_q="TND",
         )
         mla_output, _ = flash_mla_with_kvcache(
-            q=q,
-            k_cache=cache,
+            q=q_mla,
+            k_cache=cache_nz,
             block_table=block_table,
             cache_seqlens=cache_seqlens,
             seqused_q=seqused_q,
+            cu_seqlens_q=cu_seqlens_q,
             attn_mask=mla_attn_mask,
             metadata=metadata,
             head_dim_v=HEAD_DIM_V,
             softmax_scale=scale,
             mask_mode=3,
-            max_seqlen_q=query_len,
-            max_seqlen_kv=max_kv_len,
-            layout_q="BSND",
-            layout_kv="PA_BBND",
-            layout_out="BSND",
+            max_seqlen_q=-1,
+            max_seqlen_kv=-1,
+            layout_q="TND",
+            layout_kv="PA_NZ",
+            layout_out="NTD",
             return_softmax_lse=False,
         )
     torch.npu.synchronize()
@@ -204,9 +219,10 @@ def test_flash_mla_matches_fia_v2(dtype, query_len, kv_lengths, num_heads):
     # Normalize both outputs to the backend's final [B*S, N, 512] layout.
     shape = (batch * query_len, num_heads, HEAD_DIM_V)
     assert tuple(fia_output.shape) == (batch, num_heads, query_len, HEAD_DIM_V)
-    assert tuple(mla_output.shape) == (batch, query_len, num_heads, HEAD_DIM_V)
+    assert tuple(mla_output.shape) == (num_heads, batch * query_len, HEAD_DIM_V)
     fia = fia_output.transpose(1, 2).contiguous().reshape(shape).cpu()
-    mla = mla_output.reshape(shape).cpu()
+    # NTD -> TND.
+    mla = mla_output.transpose(0, 1).contiguous().cpu()
     expected = expected.reshape(shape)
     # Numerical equivalence, not bitwise equality across different kernels.
     atol, rtol = (2e-3, 2e-3) if dtype == torch.float16 else (1e-2, 1e-2)

@@ -70,6 +70,32 @@ CUDA 初始默认 Breakable；多模态模型若只在 Piecewise 白名单、未
 
 源码依据：`model_executor/cuda_graph_config.py`（类型与初始默认）、`runner_backend/utils.py`（实际分派）、`arg_groups/cuda_graph_hook.py`（兼容与白名单策略）、`configs/model_config.py`（模型白名单）、`multimodal/vit_cuda_graph_runner.py` 与 NPU 同名组件（视觉捕获）。
 
+## GPU Prefill Full 与 Decode Full 的源码对照
+
+NPU Prefill Full 的缺口与接入方案见同目录 `npu_prefill_full_enablement_analysis.md`，包含 Runner 类型判断、Prefill 元数据、算子拓扑、Host 参数更新、Prefix 与分阶段验证。
+
+两者共用 `FullCudaGraphBackend`，底层都是两次 warmup 后录制一张 CUDA Graph，随后刷新静态输入并 replay。差异主要由 Runner 决定：捕获哪个 callable、如何固定输入形状、如何准备注意力元数据以及如何处理输出。
+
+| 项目 | GPU Prefill Full | GPU Decode Full |
+|---|---|---|
+| Runner | PrefillCudaGraphRunner | DecodeCudaGraphRunner |
+| 捕获函数 | `_run_forward` 调用 `layer_model.forward`，即 Transformer body | `capture_one_shape.run_once` 调用模型 forward，并执行 capture_tail_hooks |
+| 常见图输出 | hidden states / body 输出 | LogitsProcessorOutput；PP 中间 stage 为 PPProxyTensors |
+| LM head / logits | 在图外，使用实际请求 batch 执行 | 通常在模型 forward 图内；具体模型、stage 或扩展 Runner 可不同 |
+| 形状轴 | 聚合 token bucket + 固定 request slots | 普通 Decode 请求数 bucket；Verify 固定 width，部分 ragged 模式按 token bucket |
+| 空位处理 | token 补到 bucket，unused request slots 为零长度 sentinel | 请求补到 bucket，长度填充值由 attention backend 决定 |
+| 图外 attention 准备 | 对 slot-padded view 调用 out_graph，更新 seq_lens、extend_seq_lens、extend_prefix_lens 等 | load_batch 对 padded batch 调用 out_graph，刷新 KV/请求元数据 |
+| 图内 metadata 入口 | Prefill Runner 的 run_once 没有显式调用通用 in_graph hook；body 内实际操作由模型与 attention 实现决定 | run_once 显式调用 init_forward_metadata_in_graph，再执行模型 forward |
+| 缓存前缀 | 可捕获 chunked_prefix 变体，需 attention backend 声明支持 | 普通 Decode 直接查询已有 KV；无对应 Prefill prefix-chunk 变体机制 |
+| Replay 组织 | 临时将 layer_model.forward 替换为 replay closure；外层 model.forward eager 执行 | 直接 backend.replay，再执行通用后处理与输出裁剪 |
+| 输出裁剪 | body hidden states 先裁到真实 token 数，eager tail 使用真实请求信息 | logits/hidden states 按 raw_num_token 裁剪；PP 按 bs × width 保留 token 行 |
+| 输出缓冲区 | 工厂开启 reuse_output_buffer=True，尝试共享 body 输出 buffer | 工厂不启用此选项 |
+| 额外准入条件 | 请求数不超过 slots、prefix 能覆盖、context 上限、padding 比例等 | bucket、verify width、encoder length、TBO 与图变体等 |
+
+**Prefill Full 的 Full 是“Transformer body 整段捕获”，不是整个服务请求或整个外层 model.forward 都入图。** Prefill 的实际执行结构是：图外输入/元数据准备 → body Graph replay → 按真实 token 数裁剪 → eager LM head/logits。Decode 通常是：图外输入/元数据准备 → 包含模型 forward 与相关输出计算的 Graph replay → 输出裁剪。
+
+源码位置：Prefill `_run_forward`（781）、`_prepare_forward_metadata_for_replay`（1189）、`capture_one_shape`（1635）、`_execute_body_capture`（2046）；Decode `capture_one_shape`（1174）、`execute`（1526）；共享机制 `runner_backend/full_cuda_graph_backend.py`。行号基于本文固定提交。
+
 ## 1. 结论先行
 
 **NPU 复用了社区的 Runner、静态输入缓冲区和捕获分桶框架，但在“注意力算子的动态主机参数更新”以及部分执行入口上保留了专用实现。框架复用程度高，行为上的泛化程度仍由具体算子、注意力架构和推理模式共同决定。**

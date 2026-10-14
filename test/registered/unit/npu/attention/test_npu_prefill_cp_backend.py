@@ -42,7 +42,7 @@ for _ in (
 from sglang.srt.hardware_backend.npu.attention import ascend_backend
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
-    DSACPSegmentMetadata,
+    DSACPCombinedMetadata,
     _cp_allgather_and_save_kv_npu,
 )
 from sglang.srt.layers.attention.dsa import dsa_npu_indexer
@@ -123,20 +123,23 @@ class TestCPKVWrite(unittest.TestCase):
 
 class TestZigzagSparseAttention(unittest.TestCase):
     @staticmethod
-    def _segments(meta, tables):
+    def _combined(meta, tables):
         split = meta.total_q_prev_tokens
-        return (
-            DSACPSegmentMetadata(
-                0, split, meta.cu_seqlens_q_prev_tensor[1:],
-                meta.kv_len_prev_tensor, tables,
+        return DSACPCombinedMetadata(
+            logical_tokens=split + meta.total_q_next_tokens,
+            actual_seq_lengths_q=torch.cat(
+                [
+                    meta.cu_seqlens_q_prev_tensor[1:],
+                    meta.cu_seqlens_q_next_tensor[1:] + split,
+                ]
             ),
-            DSACPSegmentMetadata(
-                split, split + meta.total_q_next_tokens,
-                meta.cu_seqlens_q_next_tensor[1:], meta.kv_len_next_tensor, tables,
+            actual_seq_lengths_kv=torch.cat(
+                [meta.kv_len_prev_tensor, meta.kv_len_next_tensor]
             ),
+            block_tables=torch.cat([tables, tables], dim=0),
         )
 
-    def test_prepare_zigzag_batched_segments(self):
+    def test_prepare_zigzag_batched_combined_metadata(self):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
         tables = torch.tensor([[11, 12], [21, 22]], dtype=torch.int32)
         backend.forward_metadata = SimpleNamespace(block_tables=tables)
@@ -148,6 +151,8 @@ class TestZigzagSparseAttention(unittest.TestCase):
             cu_seqlens_q_next_tensor=torch.tensor([0, 2, 5]),
             kv_len_prev_tensor=torch.tensor([6, 9]),
             kv_len_next_tensor=torch.tensor([13, 19]),
+            cu_seqlens_q_combined_tensor=torch.tensor([0, 3, 7, 9, 12]),
+            kv_len_combined_tensor=torch.tensor([6, 9, 13, 19]),
         )
         batch = SimpleNamespace(
             attn_cp_metadata=meta,
@@ -173,14 +178,11 @@ class TestZigzagSparseAttention(unittest.TestCase):
         fm = backend.forward_metadata
         self.assertIs(fm.block_tables, tables)
         self.assertIs(fm.dsa_cp_request_block_tables, tables)
-        prev, next_ = fm.dsa_cp_segments
-        self.assertEqual((prev.start, prev.end, next_.start, next_.end), (0, 7, 7, 12))
-        self.assertEqual(prev.actual_seq_lengths_q.tolist(), [3, 7])
-        self.assertEqual(next_.actual_seq_lengths_q.tolist(), [2, 5])
-        self.assertEqual(prev.actual_seq_lengths_kv.tolist(), [6, 9])
-        self.assertEqual(next_.actual_seq_lengths_kv.tolist(), [13, 19])
-        self.assertIs(prev.block_tables, tables)
-        self.assertIs(next_.block_tables, tables)
+        combined = fm.dsa_cp_combined
+        self.assertEqual(combined.logical_tokens, 12)
+        self.assertEqual(combined.actual_seq_lengths_q.tolist(), [3, 7, 9, 12])
+        self.assertEqual(combined.actual_seq_lengths_kv.tolist(), [6, 9, 13, 19])
+        torch.testing.assert_close(combined.block_tables, torch.cat([tables, tables]))
 
     def test_prepare_retains_request_tables_for_attention(self):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
@@ -214,7 +216,7 @@ class TestZigzagSparseAttention(unittest.TestCase):
         self.assertEqual(fm.actual_seq_lengths_q.tolist(), [1, 2, 3, 4])
         self.assertEqual(fm.actual_seq_lengths_kv.tolist(), [1, 2, 7, 8])
 
-    def test_two_segments_match_per_token_causal_reference(self):
+    def test_combined_attention_matches_per_token_causal_reference(self):
         """Uneven front/back blocks, two requests, prefixes and physical pad."""
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
         request_tables = torch.tensor([[0], [1]], dtype=torch.int32)
@@ -239,7 +241,7 @@ class TestZigzagSparseAttention(unittest.TestCase):
             kv_len_prev_tensor=torch.tensor([3, 5]),
             kv_len_next_tensor=torch.tensor([9, 10]),
         )
-        backend.forward_metadata.dsa_cp_segments = self._segments(meta, request_tables)
+        backend.forward_metadata.dsa_cp_combined = self._combined(meta, request_tables)
         calls = []
 
         def reference_row(query, request_id, end):
@@ -249,7 +251,9 @@ class TestZigzagSparseAttention(unittest.TestCase):
 
         def sparse_attention(**kwargs):
             calls.append(kwargs)
-            self.assertIs(kwargs["block_table"], request_tables)
+            torch.testing.assert_close(
+                kwargs["block_table"], torch.cat([request_tables, request_tables])
+            )
             self.assertIs(kwargs["key"], kv)
             self.assertIs(kwargs["value"], kv)
             query = kwargs["query"]
@@ -257,7 +261,8 @@ class TestZigzagSparseAttention(unittest.TestCase):
             lengths = kwargs["actual_seq_lengths_kv"].tolist()
             self.assertEqual(cumulative[-1], query.shape[0])
             rows, start = [], 0
-            for request_id, (end, kv_len) in enumerate(zip(cumulative, lengths)):
+            for sequence_id, (end, kv_len) in enumerate(zip(cumulative, lengths)):
+                request_id = int(kwargs["block_table"][sequence_id, 0])
                 for row in range(start, end):
                     # Bottom-right causal alignment of a contiguous Q block.
                     visible = kv_len - (end - start) + row - start + 1
@@ -279,13 +284,13 @@ class TestZigzagSparseAttention(unittest.TestCase):
                 SimpleNamespace(scaling=1.0),
                 SimpleNamespace(attn_cp_metadata=meta),
             )
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0]["actual_seq_lengths_query"].tolist(), [1, 3])
-        self.assertEqual(calls[1]["actual_seq_lengths_query"].tolist(), [2, 3])
-        for call, start, end in ((calls[0], 0, 3), (calls[1], 3, 6)):
-            torch.testing.assert_close(call["query"], q[start:end])
-            torch.testing.assert_close(call["query_rope"], rope[start:end])
-            self.assertEqual(call["sparse_indices"].shape[0], end - start)
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(call["actual_seq_lengths_query"].tolist(), [1, 3, 5, 6])
+        self.assertEqual(call["actual_seq_lengths_kv"].tolist(), [3, 5, 9, 10])
+        torch.testing.assert_close(call["query"], q[:6])
+        torch.testing.assert_close(call["query_rope"], rope[:6])
+        self.assertEqual(call["sparse_indices"].shape[0], 6)
         expected = torch.stack(
             [
                 reference_row(q[row], request_id, position + 1)
@@ -295,7 +300,7 @@ class TestZigzagSparseAttention(unittest.TestCase):
         torch.testing.assert_close(out[:6], expected)
         torch.testing.assert_close(out[6:], torch.zeros_like(out[6:]))
 
-    def test_split_uses_metadata_not_physical_midpoint(self):
+    def test_combined_attention_trims_padding(self):
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
         backend.forward_metadata = SimpleNamespace(
             dsa_cp_request_block_tables=torch.zeros(1, 1, dtype=torch.int32)
@@ -308,7 +313,7 @@ class TestZigzagSparseAttention(unittest.TestCase):
             kv_len_prev_tensor=torch.tensor([4]),
             kv_len_next_tensor=torch.tensor([9]),
         )
-        backend.forward_metadata.dsa_cp_segments = self._segments(
+        backend.forward_metadata.dsa_cp_combined = self._combined(
             meta, backend.forward_metadata.dsa_cp_request_block_tables
         )
         q = torch.arange(8, dtype=torch.float32).view(8, 1, 1)
@@ -332,12 +337,13 @@ class TestZigzagSparseAttention(unittest.TestCase):
                 SimpleNamespace(scaling=1.0),
                 SimpleNamespace(attn_cp_metadata=meta),
             )
-        self.assertEqual([c["query"].shape[0] for c in calls], [2, 1])
+        self.assertEqual([c["query"].shape[0] for c in calls], [3])
+        self.assertEqual(calls[0]["actual_seq_lengths_query"].tolist(), [2, 3])
         torch.testing.assert_close(out[:3], q[:3])
         self.assertEqual(out.shape, q.shape)
         torch.testing.assert_close(out[3:], torch.zeros_like(q[3:]))
 
-    def test_indexer_segments_align_query_weights_and_topk(self):
+    def test_combined_indexer_aligns_query_weights_and_topk(self):
         indexer = dsa_npu_indexer.DSANPUIndexerMixin()
         indexer.index_topk = 2
         tables = torch.tensor([[0], [1]], dtype=torch.int32)
@@ -349,7 +355,7 @@ class TestZigzagSparseAttention(unittest.TestCase):
             kv_len_next_tensor=torch.tensor([9, 10]),
         )
         backend = SimpleNamespace(forward_metadata=SimpleNamespace(
-            dsa_cp_segments=self._segments(meta, tables)
+            dsa_cp_combined=self._combined(meta, tables)
         ))
         q = torch.arange(8, dtype=torch.float32).view(8, 1, 1)
         weights = torch.arange(8, dtype=torch.float32).view(8, 1)
@@ -369,17 +375,39 @@ class TestZigzagSparseAttention(unittest.TestCase):
             patch.object(dsa_npu_indexer, "torch_npu", fake_npu, create=True),
         ):
             out = indexer.do_npu_cp_zigzag_indexer(q, key, weights)
-        self.assertEqual(len(calls), 2)
-        for call, start, end, q_lengths in (
-            (calls[0], 0, 3, [1, 3]), (calls[1], 3, 5, [1, 2])
-        ):
-            self.assertIs(call["block_table"], tables)
-            self.assertIs(call["key"], key)
-            torch.testing.assert_close(call["query"], q[start:end])
-            torch.testing.assert_close(call["weights"], weights[start:end])
-            self.assertEqual(call["actual_seq_lengths_query"].tolist(), q_lengths)
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        torch.testing.assert_close(call["block_table"], torch.cat([tables, tables]))
+        self.assertIs(call["key"], key)
+        torch.testing.assert_close(call["query"], q[:5])
+        torch.testing.assert_close(call["weights"], weights[:5])
+        self.assertEqual(call["actual_seq_lengths_query"].tolist(), [1, 3, 4, 5])
+        self.assertEqual(call["actual_seq_lengths_key"].tolist(), [3, 5, 9, 10])
         self.assertEqual(out.shape, (5, 2))
         self.assertEqual(out[:, 0].tolist(), [0, 1, 2, 3, 4])
+
+    def test_combined_attention_without_padding(self):
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.forward_metadata = SimpleNamespace(
+            dsa_cp_combined=DSACPCombinedMetadata(
+                logical_tokens=3,
+                actual_seq_lengths_q=torch.tensor([2, 3]),
+                actual_seq_lengths_kv=torch.tensor([4, 9]),
+                block_tables=torch.tensor([[0], [0]]),
+            )
+        )
+        q = torch.arange(3, dtype=torch.float32).view(3, 1, 1)
+        with patch.object(
+            ascend_backend.torch_npu,
+            "npu_sparse_flash_attention",
+            side_effect=lambda **kw: (kw["query"].clone(), None, None),
+        ) as op:
+            out = backend.do_cp_zigzag_attn(
+                q, q, q, q, torch.zeros(3, 1, dtype=torch.int32),
+                SimpleNamespace(scaling=1.0), SimpleNamespace(),
+            )
+        self.assertEqual(op.call_count, 1)
+        torch.testing.assert_close(out, q)
 
 
 class TestDoCpAttnFia(unittest.TestCase):

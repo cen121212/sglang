@@ -87,9 +87,8 @@ def _reshape_kv_for_fia_nz(
 
 
 @dataclass
-class DSACPSegmentMetadata:
-    start: int
-    end: int
+class DSACPCombinedMetadata:
+    logical_tokens: int
     actual_seq_lengths_q: torch.Tensor
     actual_seq_lengths_kv: torch.Tensor
     block_tables: torch.Tensor
@@ -101,7 +100,7 @@ class ForwardMetadata:
     block_tables: Optional[torch.Tensor] = None
     # Request-level tables retained before DSA CP expands them to token rows.
     dsa_cp_request_block_tables: Optional[torch.Tensor] = None
-    dsa_cp_segments: Optional[tuple[DSACPSegmentMetadata, DSACPSegmentMetadata]] = None
+    dsa_cp_combined: Optional[DSACPCombinedMetadata] = None
 
     # mapped block_tables for swa
     block_tables_swa: Optional[torch.Tensor] = None
@@ -1316,41 +1315,26 @@ class AscendAttnBackend(AttentionBackend):
         fm.dsa_cp_request_block_tables = fm.block_tables
         if is_zigzag():
             meta = forward_batch.attn_cp_metadata
-            split = int(meta.total_q_prev_tokens)
-            logical_tokens = split + int(meta.total_q_next_tokens)
+            logical_tokens = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
             assert fm.block_tables is not None
             assert fm.block_tables.shape[0] == meta.bs
-            # Each segment packs requests in original batch order. Keep the
-            # request-level page table; do not expand it to local token rows.
-            fm.dsa_cp_segments = (
-                DSACPSegmentMetadata(
-                    start=0,
-                    end=split,
-                    actual_seq_lengths_q=meta.cu_seqlens_q_prev_tensor[1:].to(
-                        device=device, dtype=torch.int32
-                    ),
-                    actual_seq_lengths_kv=meta.kv_len_prev_tensor.to(
-                        device=device, dtype=torch.int32
-                    ),
-                    block_tables=fm.block_tables,
+            # Q order is [all request front blocks, all request back blocks].
+            # Treat them as 2*bs sequences sharing the original paged KV.
+            fm.dsa_cp_combined = DSACPCombinedMetadata(
+                logical_tokens=logical_tokens,
+                actual_seq_lengths_q=meta.cu_seqlens_q_combined_tensor[1:].to(
+                    device=device, dtype=torch.int32
                 ),
-                DSACPSegmentMetadata(
-                    start=split,
-                    end=logical_tokens,
-                    actual_seq_lengths_q=meta.cu_seqlens_q_next_tensor[1:].to(
-                        device=device, dtype=torch.int32
-                    ),
-                    actual_seq_lengths_kv=meta.kv_len_next_tensor.to(
-                        device=device, dtype=torch.int32
-                    ),
-                    block_tables=fm.block_tables,
+                actual_seq_lengths_kv=meta.kv_len_combined_tensor.to(
+                    device=device, dtype=torch.int32
                 ),
+                block_tables=torch.cat([fm.block_tables, fm.block_tables], dim=0),
             )
             forward_batch.dsa_cp_local_positions = local_positions
             forward_batch.dsa_cp_metadata_prepared = True
             return
 
-        fm.dsa_cp_segments = None
+        fm.dsa_cp_combined = None
 
         # Per-token request ids for the local rows: the Ascend paged-attention
         # operators consume per-token block-table rows under CP (same
@@ -1472,43 +1456,33 @@ class AscendAttnBackend(AttentionBackend):
         layer,
         forward_batch,
     ):
-        """Run the front/back query blocks against the same full paged KV.
-
-        Indexer and attention share segments prepared before model layers.
-        """
-        segments = self.forward_metadata.dsa_cp_segments
-        assert segments is not None
-        logical_tokens = segments[-1].end
+        """Run all zigzag blocks as 2*bs sequences in one sparse-attn call."""
+        meta = self.forward_metadata.dsa_cp_combined
+        assert meta is not None
+        logical_tokens = meta.logical_tokens
         pad_rows = q_nope.shape[0] - logical_tokens
         assert pad_rows >= 0
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
         assert topk_indices.shape[0] >= logical_tokens
 
-        outputs = []
-        for segment in segments:
-            start, end = segment.start, segment.end
-            if start == end:
-                continue
-            out, _, _ = torch_npu.npu_sparse_flash_attention(
-                query=q_nope[start:end].contiguous(),
-                key=k_nope,
-                value=k_nope,
-                query_rope=q_pe[start:end].contiguous(),
-                key_rope=k_pe,
-                sparse_indices=topk_indices[start:end].contiguous(),
-                scale_value=layer.scaling,
-                actual_seq_lengths_query=segment.actual_seq_lengths_q,
-                actual_seq_lengths_kv=segment.actual_seq_lengths_kv,
-                block_table=segment.block_tables,
-                sparse_block_size=1,
-                layout_query="TND",
-                layout_kv="PA_BSND",
-                sparse_mode=3,
-                attention_mode=2,
-                return_softmax_lse=False,
-            )
-            outputs.append(out)
-        attn_out = torch.cat(outputs, dim=0)
+        attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
+            query=q_nope[:logical_tokens].contiguous(),
+            key=k_nope,
+            value=k_nope,
+            query_rope=q_pe[:logical_tokens].contiguous(),
+            key_rope=k_pe,
+            sparse_indices=topk_indices[:logical_tokens].contiguous(),
+            scale_value=layer.scaling,
+            actual_seq_lengths_query=meta.actual_seq_lengths_q,
+            actual_seq_lengths_kv=meta.actual_seq_lengths_kv,
+            block_table=meta.block_tables,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=False,
+        )
         if pad_rows:
             attn_out = torch.cat(
                 [attn_out, attn_out.new_zeros(pad_rows, *attn_out.shape[1:])], dim=0

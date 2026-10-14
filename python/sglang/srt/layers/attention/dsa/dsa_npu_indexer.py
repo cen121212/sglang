@@ -244,7 +244,7 @@ class DSANPUIndexerMixin:
                 self.dsa_enable_prefill_cp
                 and forward_batch.attn_cp_metadata is not None
             ):
-                # Zigzag consumes the prepared request-level segments below;
+                # Zigzag consumes the prepared combined block metadata below;
                 # only interleave uses the per-token lengths in these fields.
                 if is_zigzag():
                     actual_seq_lengths_q = None
@@ -369,35 +369,27 @@ class DSANPUIndexerMixin:
             return topk_indices[0].squeeze(1)
 
     def do_npu_cp_zigzag_indexer(self, q, past_key_states, indexer_weights):
-        segments = get_attn_backend().forward_metadata.dsa_cp_segments
-        assert segments is not None
-        logical_tokens = segments[-1].end
+        meta = get_attn_backend().forward_metadata.dsa_cp_combined
+        assert meta is not None
+        logical_tokens = meta.logical_tokens
         assert q.shape[0] >= logical_tokens
         if indexer_weights is not None:
             indexer_weights = indexer_weights.contiguous().view(
                 -1, indexer_weights.shape[-1]
             )
-        outputs = []
-        for segment in segments:
-            start, end = segment.start, segment.end
-            if start == end:
-                continue
-            outputs.append(
-                self.do_npu_cp_balance_indexer(
-                    q[start:end].contiguous(),
-                    past_key_states,
-                    (
-                        indexer_weights[start:end].contiguous()
-                        if indexer_weights is not None
-                        else None
-                    ),
-                    segment.actual_seq_lengths_q,
-                    segment.actual_seq_lengths_kv,
-                    segment.block_tables,
-                )
-            )
-        # Keep TopK logical: attention drops physical padding before slicing it.
-        return torch.cat(outputs, dim=0)
+        # Trim physical padding; preserve [all fronts, all backs] row order.
+        return self.do_npu_cp_balance_indexer(
+            q[:logical_tokens].contiguous(),
+            past_key_states,
+            (
+                indexer_weights[:logical_tokens].contiguous()
+                if indexer_weights is not None
+                else None
+            ),
+            meta.actual_seq_lengths_q,
+            meta.actual_seq_lengths_kv,
+            meta.block_tables,
+        )
 
     def do_npu_cp_balance_indexer(
         self,

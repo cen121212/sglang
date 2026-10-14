@@ -33,7 +33,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.base import get_cp_strategy, is_zigzag
 from sglang.srt.layers.dcp.layout import (
     get_dcp_chain_spec_lens,
     get_dcp_lens,
@@ -87,9 +87,21 @@ def _reshape_kv_for_fia_nz(
 
 
 @dataclass
+class DSACPSegmentMetadata:
+    start: int
+    end: int
+    actual_seq_lengths_q: torch.Tensor
+    actual_seq_lengths_kv: torch.Tensor
+    block_tables: torch.Tensor
+
+
+@dataclass
 class ForwardMetadata:
     # calculated map for kv positions [bs * maxseqlen]
     block_tables: Optional[torch.Tensor] = None
+    # Request-level tables retained before DSA CP expands them to token rows.
+    dsa_cp_request_block_tables: Optional[torch.Tensor] = None
+    dsa_cp_segments: Optional[tuple[DSACPSegmentMetadata, DSACPSegmentMetadata]] = None
 
     # mapped block_tables for swa
     block_tables_swa: Optional[torch.Tensor] = None
@@ -1301,6 +1313,45 @@ class AscendAttnBackend(AttentionBackend):
             local_positions, forward_batch.attn_cp_metadata, dim=0
         )
 
+        fm.dsa_cp_request_block_tables = fm.block_tables
+        if is_zigzag():
+            meta = forward_batch.attn_cp_metadata
+            split = int(meta.total_q_prev_tokens)
+            logical_tokens = split + int(meta.total_q_next_tokens)
+            assert fm.block_tables is not None
+            assert fm.block_tables.shape[0] == meta.bs
+            # Each segment packs requests in original batch order. Keep the
+            # request-level page table; do not expand it to local token rows.
+            fm.dsa_cp_segments = (
+                DSACPSegmentMetadata(
+                    start=0,
+                    end=split,
+                    actual_seq_lengths_q=meta.cu_seqlens_q_prev_tensor[1:].to(
+                        device=device, dtype=torch.int32
+                    ),
+                    actual_seq_lengths_kv=meta.kv_len_prev_tensor.to(
+                        device=device, dtype=torch.int32
+                    ),
+                    block_tables=fm.block_tables,
+                ),
+                DSACPSegmentMetadata(
+                    start=split,
+                    end=logical_tokens,
+                    actual_seq_lengths_q=meta.cu_seqlens_q_next_tensor[1:].to(
+                        device=device, dtype=torch.int32
+                    ),
+                    actual_seq_lengths_kv=meta.kv_len_next_tensor.to(
+                        device=device, dtype=torch.int32
+                    ),
+                    block_tables=fm.block_tables,
+                ),
+            )
+            forward_batch.dsa_cp_local_positions = local_positions
+            forward_batch.dsa_cp_metadata_prepared = True
+            return
+
+        fm.dsa_cp_segments = None
+
         # Per-token request ids for the local rows: the Ascend paged-attention
         # operators consume per-token block-table rows under CP (same
         # convention as prepare_dsv4_cp_metadata).
@@ -1409,6 +1460,59 @@ class AscendAttnBackend(AttentionBackend):
             attention_mode=2,
             return_softmax_lse=False,
         )
+        return attn_out
+
+    def do_cp_zigzag_attn(
+        self,
+        q_nope,
+        k_nope,
+        q_pe,
+        k_pe,
+        topk_indices,
+        layer,
+        forward_batch,
+    ):
+        """Run the front/back query blocks against the same full paged KV.
+
+        Indexer and attention share segments prepared before model layers.
+        """
+        segments = self.forward_metadata.dsa_cp_segments
+        assert segments is not None
+        logical_tokens = segments[-1].end
+        pad_rows = q_nope.shape[0] - logical_tokens
+        assert pad_rows >= 0
+        topk_indices = _expand_dsa_sparse_indices(topk_indices)
+        assert topk_indices.shape[0] >= logical_tokens
+
+        outputs = []
+        for segment in segments:
+            start, end = segment.start, segment.end
+            if start == end:
+                continue
+            out, _, _ = torch_npu.npu_sparse_flash_attention(
+                query=q_nope[start:end].contiguous(),
+                key=k_nope,
+                value=k_nope,
+                query_rope=q_pe[start:end].contiguous(),
+                key_rope=k_pe,
+                sparse_indices=topk_indices[start:end].contiguous(),
+                scale_value=layer.scaling,
+                actual_seq_lengths_query=segment.actual_seq_lengths_q,
+                actual_seq_lengths_kv=segment.actual_seq_lengths_kv,
+                block_table=segment.block_tables,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+                attention_mode=2,
+                return_softmax_lse=False,
+            )
+            outputs.append(out)
+        attn_out = torch.cat(outputs, dim=0)
+        if pad_rows:
+            attn_out = torch.cat(
+                [attn_out, attn_out.new_zeros(pad_rows, *attn_out.shape[1:])], dim=0
+            )
         return attn_out
 
     def do_cp_attn_fia(
@@ -1578,16 +1682,21 @@ class AscendAttnBackend(AttentionBackend):
             and is_dsa_enable_prefill_cp()
             and forward_batch.attn_cp_metadata is not None
         ):
-            attn_out = self.do_cp_balance_attn(
-                q_nope,
-                k_nope,
-                q_pe,
-                k_pe,
-                topk_indices,
-                layer,
-                actual_seq_qlen,
-                actual_seq_lengths_kv,
-            )
+            if is_zigzag():
+                attn_out = self.do_cp_zigzag_attn(
+                    q_nope, k_nope, q_pe, k_pe, topk_indices, layer, forward_batch
+                )
+            else:
+                attn_out = self.do_cp_balance_attn(
+                    q_nope,
+                    k_nope,
+                    q_pe,
+                    k_pe,
+                    topk_indices,
+                    layer,
+                    actual_seq_qlen,
+                    actual_seq_lengths_kv,
+                )
         else:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])

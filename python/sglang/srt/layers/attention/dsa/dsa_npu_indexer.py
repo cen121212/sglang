@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.communicator import ScatterMode
+from sglang.srt.layers.cp.base import is_zigzag
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -243,13 +244,18 @@ class DSANPUIndexerMixin:
                 self.dsa_enable_prefill_cp
                 and forward_batch.attn_cp_metadata is not None
             ):
-                # V2: local metadata already prepared by prepare_dsa_cp_metadata.
-                actual_seq_lengths_q = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_q
-                )
-                actual_seq_lengths_kv = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_kv
-                )
+                # Zigzag consumes the prepared request-level segments below;
+                # only interleave uses the per-token lengths in these fields.
+                if is_zigzag():
+                    actual_seq_lengths_q = None
+                    actual_seq_lengths_kv = None
+                else:
+                    actual_seq_lengths_q = (
+                        get_attn_backend().forward_metadata.actual_seq_lengths_q
+                    )
+                    actual_seq_lengths_kv = (
+                        get_attn_backend().forward_metadata.actual_seq_lengths_kv
+                    )
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
                 actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
@@ -296,14 +302,21 @@ class DSANPUIndexerMixin:
             and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
         ):
-            topk_indices = self.do_npu_cp_balance_indexer(
-                q.view(-1, self.n_heads, self.head_dim),
-                past_key_states,
-                weights,
-                actual_seq_lengths_q,
-                actual_seq_lengths_kv,
-                block_table,
-            )
+            if is_zigzag():
+                topk_indices = self.do_npu_cp_zigzag_indexer(
+                    q.view(-1, self.n_heads, self.head_dim),
+                    past_key_states,
+                    weights,
+                )
+            else:
+                topk_indices = self.do_npu_cp_balance_indexer(
+                    q.view(-1, self.n_heads, self.head_dim),
+                    past_key_states,
+                    weights,
+                    actual_seq_lengths_q,
+                    actual_seq_lengths_kv,
+                    block_table,
+                )
             return topk_indices
         else:
             block_table = (
@@ -355,6 +368,37 @@ class DSANPUIndexerMixin:
             # Keep DSA top-k as [T, K]; NPU attention expands it when needed.
             return topk_indices[0].squeeze(1)
 
+    def do_npu_cp_zigzag_indexer(self, q, past_key_states, indexer_weights):
+        segments = get_attn_backend().forward_metadata.dsa_cp_segments
+        assert segments is not None
+        logical_tokens = segments[-1].end
+        assert q.shape[0] >= logical_tokens
+        if indexer_weights is not None:
+            indexer_weights = indexer_weights.contiguous().view(
+                -1, indexer_weights.shape[-1]
+            )
+        outputs = []
+        for segment in segments:
+            start, end = segment.start, segment.end
+            if start == end:
+                continue
+            outputs.append(
+                self.do_npu_cp_balance_indexer(
+                    q[start:end].contiguous(),
+                    past_key_states,
+                    (
+                        indexer_weights[start:end].contiguous()
+                        if indexer_weights is not None
+                        else None
+                    ),
+                    segment.actual_seq_lengths_q,
+                    segment.actual_seq_lengths_kv,
+                    segment.block_tables,
+                )
+            )
+        # Keep TopK logical: attention drops physical padding before slicing it.
+        return torch.cat(outputs, dim=0)
+
     def do_npu_cp_balance_indexer(
         self,
         q,
@@ -364,7 +408,7 @@ class DSANPUIndexerMixin:
         actual_seq_lengths_kv,
         block_table,
     ):
-        # V2: Q is local (sharded); single indexer call against full KV.
+        # One local Q segment against the full KV (also used by interleave).
         if indexer_weights is not None:
             indexer_weights = indexer_weights.contiguous().view(
                 -1, indexer_weights.shape[-1]

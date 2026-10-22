@@ -4,13 +4,87 @@
 
 状态：设计稿，未修改运行时代码，未进行设备测试。本文中的新接口和类名均为建议设计，不代表当前已实现。
 
+## 架构总览：现状与目标
+
+### 现状架构
+
+普通 Decode / MTP target verify 的设备差异通过不同 Runner 和不同 Backend 两层表达：
+
+```text
+NPU：NPUGraphRunner ──────────→ NPUCudaGraphBackend
+       继承 DecodeCudaGraphRunner
+       含 NPU 输入准备、长度更新策略、dtype、compile、profiling
+
+GPU：DecodeCudaGraphRunner ──→ FullCudaGraphBackend
+```
+
+```mermaid
+flowchart LR
+    A[Decode / Target Verify 入口] --> B{当前按设备选择 Runner}
+    B -->|GPU| C[DecodeCudaGraphRunner]
+    B -->|NPU| D[NPUGraphRunner]
+    C --> E[FullCudaGraphBackend]
+    D --> F[NPUCudaGraphBackend]
+    D -. 继承 .-> C
+```
+
+### 目标架构
+
+```text
+                                  ┌─ NPU → NPUCudaGraphBackend
+DecodeCudaGraphRunner ────────────┤
+                                  └─ GPU → FullCudaGraphBackend
+```
+
+```mermaid
+flowchart LR
+    A[Decode / Target Verify 入口] --> B[统一 DecodeCudaGraphRunner]
+    B --> C{Backend 工厂按设备与配置选择}
+    C -->|GPU Full| D[FullCudaGraphBackend]
+    C -->|NPU Full| E[NPUCudaGraphBackend]
+    D --> F[CUDA Graph capture / replay]
+    E --> G[NPU Graph capture / Host update / replay]
+```
+
+Runner 负责公共阶段调度、bucket/key、静态输入管理、同步事件和输出；Backend 提供设备能力、捕获接口、编译/profiling和Host更新策略。`NPUGraphRunner` 删除，`NPUCudaGraphBackend` 保留原名并承接有效设备差异。
+
+### MTP 阶段架构变化
+
+| 阶段 | 现状 NPU | 现状 GPU | 重构后公共 Runner | 按设备选择的 Backend |
+|---|---|---|---|---|
+| 普通 Decode / Target Verify | NPUGraphRunner | DecodeCudaGraphRunner | DecodeCudaGraphRunner | NPUCudaGraphBackend / FullCudaGraphBackend |
+| Draft Decode | EAGLEDraftNpuGraphRunner | EAGLEDraftCudaGraphRunner | EAGLEDraftCudaGraphRunner | NPUCudaGraphBackend / FullCudaGraphBackend |
+| Draft Extend for Decode | EAGLEDraftExtendNpuGraphRunner | EAGLEDraftExtendCudaGraphRunner | EAGLEDraftExtendCudaGraphRunner | NPUCudaGraphBackend / FullCudaGraphBackend |
+
+```mermaid
+flowchart LR
+    A[Target Verify] --> D[DecodeCudaGraphRunner]
+    B[Draft Decode] --> E[EAGLEDraftCudaGraphRunner]
+    C[Draft Extend] --> F[EAGLEDraftExtendCudaGraphRunner]
+    D --> G[统一 Backend 选择接口]
+    E --> G
+    F --> G
+    G --> H[GPU: FullCudaGraphBackend]
+    G --> I[NPU: NPUCudaGraphBackend]
+```
+
+图中的 Backend 是同一实现类型，不表示三个阶段共用一个可变 Backend 实例或一张图。各 Runner 保留自己的阶段上下文和捕获资源，Backend 按显式 phase 选择正确的更新策略。
+
+### 设计文档阅读顺序
+
+1. 架构总览：确认 Runner 收敛范围和设备后端关系。
+2. 第1–3节：目标、现状方法清单和职责边界。
+3. 第4–7节：接口、初始化、执行和seq_len更新方案。
+4. 第8节：普通及MTP方法迁移位置、调用点和迁移链路。
+5. 第9–12节：兼容性、实施顺序、验收及源码索引。
+
 ## 1. 背景与目标
 
 当前 NPU Decode Full 同时存在 `NPUGraphRunner(DecodeCudaGraphRunner)` 和 `NPUCudaGraphBackend`。设备差异散落在 Runner 与 Backend：Runner 决定 Host 序列长度更新、处理 DFlash 特例，并重写 execute；Backend 执行设备图捕获、异步 update 和 replay。
 
-目标是删除 NPUGraphRunner，让 GPU/NPU 使用统一 DecodeCudaGraphRunner，将 NPU 设备差异收敛到 NPUGraphBackend。Runner 只负责阶段调度、bucket、静态输入的公共管理、图 key、共享读同步和输出整理。
+目标是删除 NPUGraphRunner，让 GPU/NPU 使用统一 DecodeCudaGraphRunner，将 NPU 设备差异收敛到 NPUCudaGraphBackend。Runner 只负责阶段调度、bucket、静态输入的公共管理、图 key、共享读同步和输出整理。
 
-建议将现有 NPUCudaGraphBackend 更名为 NPUGraphBackend，保持其原位置或同步改名文件；避免同时长期保留两个同义实现。BaseCudaGraphBackend 可保持原名称以控制改动范围，GraphBackend 在本文中表示这一抽象层。
+保留现有 NPUCudaGraphBackend、FullCudaGraphBackend 和 BaseCudaGraphBackend 名称，本次重点是职责迁移与 Runner 收敛，不要求类名或文件重命名。GraphBackend 在本文中表示后端抽象层。
 
 ### 1.1 必须达到的结果
 
@@ -51,16 +125,16 @@
 
 | 现有方法 / 定义行 | 方法作用 | 当前实际调用点 / 调用链 | 重构后位置与处理方式 |
 |---|---|---|---|
-| `__init__` / 100 | 安装NPU编译patch，调用父类完成buffer/捕获初始化，初始化属性映射、V2与FIA相关状态 | `cuda_graph_setup.py:733`设备映射实例化；`eagle_worker_v2.py:1736`自适应target Runner创建 | 公共`DecodeCudaGraphRunner.__init__`保留阶段初始化；设备状态迁入`NPUGraphBackend.__init__`/捕获绑定规格。Backend所需capture mode等晚就绪字段在bind_resources或capture阶段绑定；禁止在早期构造时读取未初始化Runner字段 |
-| `_init_arch_map` / 139 | 建立属性名和参数类型映射；DLLM与普通模型的MHA映射不同 | 当前类`__init__:127`；同名draft方法是另一类的独立实现 | `NPUGraphBackend`的HostInputUpdatePolicy初始化；按捕获记录保存实际使用的键与类型，不把整个映射误当成当前算子选择结果 |
-| `_create_device_graph` / 160 | 返回`torch.npu.NPUGraph()` | 当前Decode捕获链未发现调用；主路径由Backend.capture_one直接创建图 | 合并到`NPUGraphBackend.capture_one`或其私有`_create_graph`；删除Runner旧方法，不增加重复入口 |
-| `_uses_v2_seq_len_update` / 163 | 根据模型V2标记，以及FIAS V2 BSND与捕获模式，选择V2长度协议；IDLE rank沿捕获模式判断 | `_get_update_attr_name:190`、`_get_update_attr_type:195` | `NPUGraphBackend`的捕获绑定规格/私有策略方法；选择基于捕获协议，不仅依赖本轮runtime mode |
-| `_capture_graph` / 171 | 包装NPU graph上下文，传pool/stream/auto_dispatch_capture=True；compile时跳过guard求值 | 当前Decode主捕获链未发现调用；Backend.capture_one已实现同类逻辑 | 合并到`NPUGraphBackend.capture_one`，保留现有warmup、memory-saver和guard语义，删除Runner重复方法 |
-| `_get_update_attr_name` / 189 | V2返回actual_seq_kvlen；否则返回MLA映射的actual_seq_lengths_kv | 当前类`execute:408` | `NPUGraphBackend`的HostInputUpdatePolicy / CaptureRecord；replay内部使用，Runner不传属性名 |
+| `__init__` / 100 | 安装NPU编译patch，调用父类完成buffer/捕获初始化，初始化属性映射、V2与FIA相关状态 | `cuda_graph_setup.py:733`设备映射实例化；`eagle_worker_v2.py:1736`自适应target Runner创建 | 公共`DecodeCudaGraphRunner.__init__`保留阶段初始化；设备状态迁入`NPUCudaGraphBackend.__init__`/捕获绑定规格。Backend所需capture mode等晚就绪字段在bind_resources或capture阶段绑定；禁止在早期构造时读取未初始化Runner字段 |
+| `_init_arch_map` / 139 | 建立属性名和参数类型映射；DLLM与普通模型的MHA映射不同 | 当前类`__init__:127`；同名draft方法是另一类的独立实现 | `NPUCudaGraphBackend`的HostInputUpdatePolicy初始化；按捕获记录保存实际使用的键与类型，不把整个映射误当成当前算子选择结果 |
+| `_create_device_graph` / 160 | 返回`torch.npu.NPUGraph()` | 当前Decode捕获链未发现调用；主路径由Backend.capture_one直接创建图 | 合并到`NPUCudaGraphBackend.capture_one`或其私有`_create_graph`；删除Runner旧方法，不增加重复入口 |
+| `_uses_v2_seq_len_update` / 163 | 根据模型V2标记，以及FIAS V2 BSND与捕获模式，选择V2长度协议；IDLE rank沿捕获模式判断 | `_get_update_attr_name:190`、`_get_update_attr_type:195` | `NPUCudaGraphBackend`的捕获绑定规格/私有策略方法；选择基于捕获协议，不仅依赖本轮runtime mode |
+| `_capture_graph` / 171 | 包装NPU graph上下文，传pool/stream/auto_dispatch_capture=True；compile时跳过guard求值 | 当前Decode主捕获链未发现调用；Backend.capture_one已实现同类逻辑 | 合并到`NPUCudaGraphBackend.capture_one`，保留现有warmup、memory-saver和guard语义，删除Runner重复方法 |
+| `_get_update_attr_name` / 189 | V2返回actual_seq_kvlen；否则返回MLA映射的actual_seq_lengths_kv | 当前类`execute:408` | `NPUCudaGraphBackend`的HostInputUpdatePolicy / CaptureRecord；replay内部使用，Runner不传属性名 |
 | `_get_update_attr_type` / 194 | 选择捕获协议要求的list或CPU tensor类型描述 | 当前类`execute:409` | 与属性名一起迁入Backend绑定规格；禁止属性名/类型由不同层分别推导 |
-| `_update_inputs` / 199 | 可选转CPU int32 tensor，再通过`self.graphs[self.bs].update`更新Host输入 | 当前生产路径未发现调用；execute实际调用Backend.replay_with_input_update，未调用该方法 | 删除旧入口；唯一更新实现位于`NPUGraphBackend`。不迁移self.graphs/self.bs式访问，也不保留没有有效调用者的update_attr_name/type字段 |
-| `_cache_loc_dtype` / 207 | 为cache location静态buffer选择int32 | 父类`DecodeCudaGraphRunner.__init__`动态派发：第436行输入buffer、第464行registry创建时调用 | `NPUGraphBackend.capabilities.cache_loc_dtype`，通过早期构造/描述在分配前提供；公共Runner只读取能力。GPU维持原dtype |
-| `_init_profile_context_and_memory_record` / 210 | 建立torch_npu profiler，记录CPU/NPU活动、shape/memory，通过异步trace handler导出到graph_capture_profile目录 | 父类`capture:1078`，开启capture profiling时动态派发 | `NPUGraphBackend.capture_profile_context(profile_options)`；公共Runner继续控制profiler作用域。torch_npu导入延迟到NPU实现 |
+| `_update_inputs` / 199 | 可选转CPU int32 tensor，再通过`self.graphs[self.bs].update`更新Host输入 | 当前生产路径未发现调用；execute实际调用Backend.replay_with_input_update，未调用该方法 | 删除旧入口；唯一更新实现位于`NPUCudaGraphBackend`。不迁移self.graphs/self.bs式访问，也不保留没有有效调用者的update_attr_name/type字段 |
+| `_cache_loc_dtype` / 207 | 为cache location静态buffer选择int32 | 父类`DecodeCudaGraphRunner.__init__`动态派发：第436行输入buffer、第464行registry创建时调用 | `NPUCudaGraphBackend.capabilities.cache_loc_dtype`，通过早期构造/描述在分配前提供；公共Runner只读取能力。GPU维持原dtype |
+| `_init_profile_context_and_memory_record` / 210 | 建立torch_npu profiler，记录CPU/NPU活动、shape/memory，通过异步trace handler导出到graph_capture_profile目录 | 父类`capture:1078`，开启capture profiling时动态派发 | `NPUCudaGraphBackend.capture_profile_context(profile_options)`；公共Runner继续控制profiler作用域。torch_npu导入延迟到NPU实现 |
 | `_post_process_after_profile` / 234 | 当前为空；NPU trace已通过handler导出，不做GPU式内存内后处理 | 父类`capture:1120`调用 | Backend profiling接口显式完成收尾或提供无操作finalize；不要求复制一个无内容Runner override |
 | `execute` / 238 | 刷新本轮输入/元数据，处理预规划和DFlash特例，生成Host长度更新，调用replay并裁剪输出 | `ModelRunner._forward_raw:1917`经decode_cuda_graph_runner.execute动态派发；Runner为NPUGraphRunner时进入此实现 | 不整体搬迁。公共Runner.execute保留调度、key、事件、计时、输出；NPU特殊准备进入prepare_replay，Host更新进入Backend.replay，详见2.3 |
 
@@ -78,7 +152,7 @@ NPUGraphRunner.__init__:112
 
 作用：enable_compile时使用`torch.compile(torch.no_grad()(model.forward), fullgraph=True, dynamic=False, backend=npugraph_ex)`；未开启则直接返回model.forward。签名中的num_tokens、tp_group当前函数体未使用，不能据此声称实现了shape或通信特化。
 
-重构后放置于`NPUGraphBackend.capture_forward_context(...)`，由公共捕获循环显式调用并获取callable。删除模块级函数替换，避免NPU Runner创建后改变同进程其他Runner的编译行为。
+重构后放置于`NPUCudaGraphBackend.capture_forward_context(...)`，由公共捕获循环显式调用并获取callable。删除模块级函数替换，避免NPU Runner创建后改变同进程其他Runner的编译行为。
 
 ### 2.3 `execute()` 内部分支的具体归属
 
@@ -90,9 +164,9 @@ execute包含多种职责，下面明确每部分迁到哪里，防止新Backend
 | 非DFlash预规划 / 246–263 | 不重做metadata、不读CPU长度；补刷input_ids、positions及按条件mRoPE | Backend.prepare_replay返回PREPLANNED_REFRESH与字段需求，公共slot刷新执行；保持DSA/V4路径不新增同步 |
 | DFlash预规划特例 / 264–368 | 重新确认B/raw token数，恢复DeepEP模式、DP token数，刷新embedding、mRoPE、长度、req indices、KV写入位置并重新准备metadata | Backend.prepare_replay返回FORCE_REFRESH；公共bucket/registry/build_replay_fb_view执行输入准备；Attention backend执行metadata初始化 |
 | `graph_key = _make_graph_key(self.bs)` / 370 | 旧实现按B重建key | 删除；公共Runner生成完整key并传入GraphReplayContext，Backend直接使用 |
-| DSA/V4判定与长度准备 / 372–404 | 决定直接replay或Host update；verify处理DFlash长度与验证宽度 | NPUGraphBackend的HostInputUpdatePolicy，读取准备完成后的本轮context/metadata |
-| `replay_with_input_update` / 405–410 | 传长度、属性名和类型给NPU后端 | 收敛到NPUGraphBackend.replay内部；公共Runner只调用统一replay入口 |
-| 直接`backend.replay` / 411–412 | DSA/V4不做此Host重绑定 | NPUGraphBackend.replay的NONE更新策略，不能跳过上游设备数据刷新 |
+| DSA/V4判定与长度准备 / 372–404 | 决定直接replay或Host update；verify处理DFlash长度与验证宽度 | NPUCudaGraphBackend的HostInputUpdatePolicy，读取准备完成后的本轮context/metadata |
+| `replay_with_input_update` / 405–410 | 传长度、属性名和类型给NPU后端 | 收敛到NPUCudaGraphBackend.replay内部；公共Runner只调用统一replay入口 |
+| 直接`backend.replay` / 411–412 | DSA/V4不做此Host重绑定 | NPUCudaGraphBackend.replay的NONE更新策略，不能跳过上游设备数据刷新 |
 | logits/full_logits/hidden裁剪 / 414以后 | 使用raw_num_token整理输出，但旧实现重新构造输出对象 | 公共Runner输出整理，保留dataclasses.replace和扩展字段 |
 | PP输出裁剪 / 方法末尾 | 旧实现按bs裁剪 | 公共Runner的token宽度协议；与旧行为差异作为明确修正验收，不静默忽略 |
 
@@ -106,7 +180,7 @@ execute包含多种职责，下面明确每部分迁到哪里，防止新Backend
 
 ## 3. 职责划分
 
-| 职责 | 统一 Runner | NPUGraphBackend | Attention backend |
+| 职责 | 统一 Runner | NPUCudaGraphBackend | Attention backend |
 |---|---|---|---|
 | 模式、B bucket、真实 token 数、完整 ShapeKey | 负责 | 消费结果 | 不重新决定 |
 | 通用静态输入 copy/padding | 负责 | 提供特殊准备策略 | 必要时提供元数据计算 |
@@ -184,7 +258,7 @@ ForwardBatch 本身仍可能可变；“只读”指 Backend 不随意重绑公�
 
 公共 Runner 继续计算/验证 B、raw_B、token 数和完整 ShapeKey，再通过 registry 执行复制与padding。必要的静态资源以窄接口提供给 Backend，不允许 Backend 重写 Runner.bs 等字段。
 
-DFlash 当前特殊逻辑迁移为 NPUGraphBackend 的 preparation 策略：没有有效预规划时强制重新选择/确认 bucket，刷新 DP token、seq_lens/CPU副本、req indices、cache loc、必要 embedding/mRoPE，然后公共调用 metadata 初始化。通用复制能力复用 Runner/registry，不在 Backend 再复制一份字段清单。
+DFlash 当前特殊逻辑迁移为 NPUCudaGraphBackend 的 preparation 策略：没有有效预规划时强制重新选择/确认 bucket，刷新 DP token、seq_lens/CPU副本、req indices、cache loc、必要 embedding/mRoPE，然后公共调用 metadata 初始化。通用复制能力复用 Runner/registry，不在 Backend 再复制一份字段清单。
 
 ### 4.4 ReplayContext：准备完成后的最终事实
 
@@ -286,7 +360,7 @@ flowchart TD
 
 现有顺序为：等待上次rebind fence → worker提交graph.update → 主线程graph.replay → future.result → 记录fence。
 
-重构阶段默认保留此策略，隔离在 NPUGraphBackend 中；不能未经验证改成同步等待update再replay，也不能删除fence。应确认目标torch_npu版本对update/replay的运行时契约，保证replay使用本轮绑定。
+重构阶段默认保留此策略，隔离在 NPUCudaGraphBackend 中；不能未经验证改成同步等待update再replay，也不能删除fence。应确认目标torch_npu版本对update/replay的运行时契约，保证replay使用本轮绑定。
 
 要求：
 
@@ -301,7 +375,7 @@ flowchart TD
 
 | NPUGraphRunner现有内容 | 目标位置 / 处理 |
 |---|---|
-| patch_model_npu和全局patch | NPUGraphBackend.capture_forward_context，删除全局修改 |
+| patch_model_npu和全局patch | NPUCudaGraphBackend.capture_forward_context，删除全局修改 |
 | _init_arch_map / V2判断 / getter | Backend CaptureRecord与HostInputUpdatePolicy |
 | _create_device_graph / _capture_graph | Backend现有capture_one统一承接，确认无调用后删除旧方法 |
 | _update_inputs | 并入Backend唯一更新入口，删除重复图表访问 |
@@ -309,7 +383,7 @@ flowchart TD
 | NPU profiler / postprocess | Backend profiling接口 |
 | execute普通load/preplanned分支 | 公共Runner + Backend准备策略 |
 | execute DFlash补刷新 | Backend声明FORCE_REFRESH，公共slot/metadata刷新实现 |
-| seq_len构造与Host update选择 | NPUGraphBackend，统一普通/verify/draft/extend策略 |
+| seq_len构造与Host update选择 | NPUCudaGraphBackend，统一普通/verify/draft/extend策略 |
 | graph_key重建 | 删除，统一使用最终GraphReplayContext.shape_key |
 | logits/hidden/PP输出处理 | 删除NPU重复实现，使用公共输出处理并保留扩展字段 |
 
@@ -329,9 +403,9 @@ flowchart TD
 
 | 创建入口 | 当前NPU类型 | 目标 |
 |---|---|---|
-| Device2DraftCudaGraphRunner | EAGLEDraftNpuGraphRunner | 公共 EAGLEDraftCudaGraphRunner + NPUGraphBackend |
-| Device2ExtendCudaGraphRunner | EAGLEDraftExtendNpuGraphRunner | 公共 EAGLEDraftExtendCudaGraphRunner + NPUGraphBackend |
-| target verify 常规/自适应创建 | NPUGraphRunner | 公共 DecodeCudaGraphRunner + NPUGraphBackend |
+| Device2DraftCudaGraphRunner | EAGLEDraftNpuGraphRunner | 公共 EAGLEDraftCudaGraphRunner + NPUCudaGraphBackend |
+| Device2ExtendCudaGraphRunner | EAGLEDraftExtendNpuGraphRunner | 公共 EAGLEDraftExtendCudaGraphRunner + NPUCudaGraphBackend |
+| target verify 常规/自适应创建 | NPUGraphRunner | 公共 DecodeCudaGraphRunner + NPUCudaGraphBackend |
 
 两个公共 draft Runner 已调用 resolve_decode_backend，位置分别为 `eagle_draft_cuda_graph_runner.py:281`、`eagle_draft_extend_cuda_graph_runner.py:299`。应复用该后端选择链，不在 worker 中再创建第二套 NPU graph/update 管理对象。
 
@@ -408,6 +482,81 @@ MTP追加验收项：
 - GPU原有backend白名单和draft-extend开关行为不变。
 - verify图仍走target公共图链，未被错误地在draft worker重复捕获。
 - adaptive配置切换时三阶段捕获描述、资源与generation保持一致。
+
+### 8.7 EAGLEDraftNpuGraphRunner：逐方法作用、调用点与迁移位置
+
+文件：`hardware_backend/npu/graph_runner/eagle_draft_npu_graph_runner.py`。该类继承公共EAGLEDraftCudaGraphRunner，没有独立重写捕获循环；实例化时由父类组织捕获，并通过resolve_decode_backend选择NPU设备图实现。
+
+| 定制方法 / 定义行 | 作用 | 当前调用点 / 调用链 | 重构后放置位置 |
+|---|---|---|---|
+| `__init__` / 37 | 先初始化Host属性映射，再调用父类构造，分配静态buffer并完成draft捕获 | `eagle_worker_v2.py:_capture_cuda_graphs:451`中，设备映射选择EAGLEDraftNpuGraphRunner，S>1时实例化 | worker改为创建公共EAGLEDraftCudaGraphRunner；Backend早期构造接收DRAFT_DECODE阶段，初始化NPU更新策略；父类公共初始化负责buffer及捕获 |
+| `_init_arch_map` / 41 | 定义MLA→actual_seq_lengths_kv/list，MHA→context_lens/CPU tensor的映射 | 本类`__init__:38` | NPUCudaGraphBackend的DRAFT_DECODE HostInputUpdatePolicy或CaptureRecord；当前实际getter固定取MLA项，迁移不能直接改成按架构选择 |
+| `_cache_loc_dtype` / 51 | 返回int32供NPU cache location使用 | 父类`EAGLEDraftCudaGraphRunner.__init__:178`分配out_cache_loc时动态派发 | `NPUCudaGraphBackend.capabilities.cache_loc_dtype`，父类分配前读取；原Backend在281行才创建，必须配合两阶段构造，不可直接提前访问不存在的self.backend |
+| `_get_update_attr_name` / 54 | 当前固定返回actual_seq_lengths_kv | 本类`_replay_graph:100` | NPUCudaGraphBackend DRAFT_DECODE捕获绑定规格；Runner不再计算或传入属性名 |
+| `_get_update_attr_type` / 57 | 当前固定返回MLA对应list类型描述 | 当前本类生产路径未发现调用；draft replay直接构造cpu_update_input列表，不传attr_type | 删除该重复方法；有效类型契约在Backend绑定规格记录，不新增一个没有调用者的公共接口 |
+| `can_run_graph` / 60 | 先调用公共准入；当启用draft-extend DSA seed且attention DP>1时，将seed就绪状态与准入组合，通过TP group MIN投票得到一致结果 | `eagle_worker_common.py:226`的prepare_for_draft路径调用`cuda_graph_runner.can_run_graph`，动态派发到本方法 | 公共draft准入协调流程保留最终投票位置；NPUCudaGraphBackend提供局部额外条件和投票需求，使用既有TP group执行一次MIN。不能简单塞入仅部分路径调用的backend.can_run，详见8.5 |
+| `_replay_graph` / 90 | 非DSA/V4按step构造S−1组CPU长度并补空槽，调用Backend.replay_with_input_update；DSA/V4直接replay | 父类`EAGLEDraftCudaGraphRunner.execute:728`，在静态输入和metadata刷新后调用 | 公共父类保留薄委托`backend.replay(..., context=...)`；NPUCudaGraphBackend根据DRAFT_DECODE与S/raw_bs/padded_bs生成payload，并管理update/fence/replay |
+
+当前draft更新payload为：
+
+```python
+[
+    {"actual_seq_lengths_kv": (live_seq_lens_cpu[:raw_bs] + step + 1)
+        .tolist() + [0] * (padded_bs - raw_bs)}
+    for step in range(S - 1)
+]
+```
+
+该公式属于NPU Backend的阶段策略；公共Runner只提供本轮上下文，不能为方便迁移而继续在Runner拼装NPU属性字典。DSA/V4路径不生成这些Host长度。
+
+### 8.8 EAGLEDraftExtendNpuGraphRunner：逐方法作用、调用点与迁移位置
+
+文件：`hardware_backend/npu/graph_runner/eagle_draft_extend_npu_graph_runner.py`。该类继承公共EAGLEDraftExtendCudaGraphRunner，继承父类捕获和execute过程。
+
+| 定制方法 / 定义行 | 作用 | 当前调用点 / 调用链 | 重构后放置位置 |
+|---|---|---|---|
+| `__init__` / 31 | 只调用父类，无额外初始化逻辑 | `eagle_worker_v2.py:_capture_cuda_graphs`的Device2ExtendCudaGraphRunner映射，满足extend捕获条件时实例化 | 直接使用公共EAGLEDraftExtendCudaGraphRunner；删除无额外职责的NPU构造函数，不为它单独新增Backend方法 |
+| `_cache_loc_dtype` / 34 | 返回int32 | 父类构造第172行分配out_cache_loc时动态派发；Backend当前第299行才创建 | NPUCudaGraphBackend早期capabilities；公共父类保留分配职责。GPU Backend也提供原有int64，避免公共父类保留设备判断 |
+| `_replay_graph` / 37 | 非DSA/V4构造本轮CPU长度和padding，使用actual_seq_lengths_kv/list执行Host更新；DSA/V4直接replay | 父类`EAGLEDraftExtendCudaGraphRunner.execute:674`，前面第659行已刷新Attention metadata | 公共父类薄委托Backend.replay；NPUCudaGraphBackend的DRAFT_EXTEND策略生成一次forward的更新数据，不能复用draft_decode的S−1步公式 |
+
+当前extend更新入口等价于：
+
+```python
+backend.replay_with_input_update(
+    shape_key,
+    seq_lens=forward_batch.seq_lens_cpu.tolist()
+        + [0] * (padded_bs - raw_bs),
+    attr_name="actual_seq_lengths_kv",
+    attr_type=[],
+)
+```
+
+迁移先保持当前长度来源和padding语义。若后续要改用prepared metadata或裁剪CPU长度，必须单独证明本轮有效长度、真实batch与padding一致，不能作为纯搬迁顺带修改。
+
+此类没有覆盖can_run_graph，继承公共父类第318行；worker第1122行在draft_extend_for_decode路径检查专用图准入。无需凭空新增一个NPU extend准入override。
+
+### 8.9 两个MTP Runner的迁移后调用链
+
+```text
+EagleDraftWorker._capture_cuda_graphs
+  ├─ S>1 → 公共EAGLEDraftCudaGraphRunner(phase=DRAFT_DECODE)
+  │          → 提前创建Backend / 读取capabilities
+  │          → 分配输入buffer → 绑定资源 → 捕获draft callable
+  └─ extend条件满足 → 公共EAGLEDraftExtendCudaGraphRunner(phase=DRAFT_EXTEND)
+             → 提前创建Backend / 读取capabilities
+             → 分配B×D输入buffer → 绑定资源 → 捕获extend callable
+
+运行时：
+公共阶段准入 → 必要的跨rank最终投票
+  → 公共execute刷新静态输入/Attention metadata
+  → 公共_replay_graph薄委托
+  → NPUCudaGraphBackend.replay(context)
+      → 按阶段选择NONE / Host更新策略
+      → update/fence/replay
+  → 公共输出处理
+```
+
+验收时应确认上述两个NPU类的每个有效定制行为均有新归属；允许删除的仅是无额外逻辑构造、无有效调用的方法和已经合并的重复入口。不能仅用“两个类已删除”作为MTP重构完成的标准。
 
 ## 9. 兼容性与行为约束
 

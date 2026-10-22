@@ -45,6 +45,65 @@
 
 公共 Runner 约第 436/464 行创建 buffer，第 508 行才 resolve backend。不能简单把 `_cache_loc_dtype` 改成 `self.backend.xxx`，否则初始化顺序错误。
 
+### 2.1 按现有定制方法核对：作用、调用点与迁移位置
+
+本节以 `hardware_backend/npu/graph_runner/npu_graph_runner.py` 实际定义的方法为清单。目标位置中的新增方法名为建议接口；不要求保持旧私有方法名。所有“未发现调用”均指本次仓库生产代码静态检索结果，不代表外部插件或动态反射绝无调用；删除前应执行导入与回归测试。
+
+| 现有方法 / 定义行 | 方法作用 | 当前实际调用点 / 调用链 | 重构后位置与处理方式 |
+|---|---|---|---|
+| `__init__` / 100 | 安装NPU编译patch，调用父类完成buffer/捕获初始化，初始化属性映射、V2与FIA相关状态 | `cuda_graph_setup.py:733`设备映射实例化；`eagle_worker_v2.py:1736`自适应target Runner创建 | 公共`DecodeCudaGraphRunner.__init__`保留阶段初始化；设备状态迁入`NPUGraphBackend.__init__`/捕获绑定规格。Backend所需capture mode等晚就绪字段在bind_resources或capture阶段绑定；禁止在早期构造时读取未初始化Runner字段 |
+| `_init_arch_map` / 139 | 建立属性名和参数类型映射；DLLM与普通模型的MHA映射不同 | 当前类`__init__:127`；同名draft方法是另一类的独立实现 | `NPUGraphBackend`的HostInputUpdatePolicy初始化；按捕获记录保存实际使用的键与类型，不把整个映射误当成当前算子选择结果 |
+| `_create_device_graph` / 160 | 返回`torch.npu.NPUGraph()` | 当前Decode捕获链未发现调用；主路径由Backend.capture_one直接创建图 | 合并到`NPUGraphBackend.capture_one`或其私有`_create_graph`；删除Runner旧方法，不增加重复入口 |
+| `_uses_v2_seq_len_update` / 163 | 根据模型V2标记，以及FIAS V2 BSND与捕获模式，选择V2长度协议；IDLE rank沿捕获模式判断 | `_get_update_attr_name:190`、`_get_update_attr_type:195` | `NPUGraphBackend`的捕获绑定规格/私有策略方法；选择基于捕获协议，不仅依赖本轮runtime mode |
+| `_capture_graph` / 171 | 包装NPU graph上下文，传pool/stream/auto_dispatch_capture=True；compile时跳过guard求值 | 当前Decode主捕获链未发现调用；Backend.capture_one已实现同类逻辑 | 合并到`NPUGraphBackend.capture_one`，保留现有warmup、memory-saver和guard语义，删除Runner重复方法 |
+| `_get_update_attr_name` / 189 | V2返回actual_seq_kvlen；否则返回MLA映射的actual_seq_lengths_kv | 当前类`execute:408` | `NPUGraphBackend`的HostInputUpdatePolicy / CaptureRecord；replay内部使用，Runner不传属性名 |
+| `_get_update_attr_type` / 194 | 选择捕获协议要求的list或CPU tensor类型描述 | 当前类`execute:409` | 与属性名一起迁入Backend绑定规格；禁止属性名/类型由不同层分别推导 |
+| `_update_inputs` / 199 | 可选转CPU int32 tensor，再通过`self.graphs[self.bs].update`更新Host输入 | 当前生产路径未发现调用；execute实际调用Backend.replay_with_input_update，未调用该方法 | 删除旧入口；唯一更新实现位于`NPUGraphBackend`。不迁移self.graphs/self.bs式访问，也不保留没有有效调用者的update_attr_name/type字段 |
+| `_cache_loc_dtype` / 207 | 为cache location静态buffer选择int32 | 父类`DecodeCudaGraphRunner.__init__`动态派发：第436行输入buffer、第464行registry创建时调用 | `NPUGraphBackend.capabilities.cache_loc_dtype`，通过早期构造/描述在分配前提供；公共Runner只读取能力。GPU维持原dtype |
+| `_init_profile_context_and_memory_record` / 210 | 建立torch_npu profiler，记录CPU/NPU活动、shape/memory，通过异步trace handler导出到graph_capture_profile目录 | 父类`capture:1078`，开启capture profiling时动态派发 | `NPUGraphBackend.capture_profile_context(profile_options)`；公共Runner继续控制profiler作用域。torch_npu导入延迟到NPU实现 |
+| `_post_process_after_profile` / 234 | 当前为空；NPU trace已通过handler导出，不做GPU式内存内后处理 | 父类`capture:1120`调用 | Backend profiling接口显式完成收尾或提供无操作finalize；不要求复制一个无内容Runner override |
+| `execute` / 238 | 刷新本轮输入/元数据，处理预规划和DFlash特例，生成Host长度更新，调用replay并裁剪输出 | `ModelRunner._forward_raw:1917`经decode_cuda_graph_runner.execute动态派发；Runner为NPUGraphRunner时进入此实现 | 不整体搬迁。公共Runner.execute保留调度、key、事件、计时、输出；NPU特殊准备进入prepare_replay，Host更新进入Backend.replay，详见2.3 |
+
+### 2.2 文件级定制函数：`patch_model_npu`
+
+该函数定义于第79行，不是NPUGraphRunner成员，但由该类安装，必须随类移除一起处理。
+
+```text
+NPUGraphRunner.__init__:112
+  → torch_compile_decoration.patch_model = patch_model_npu
+  → 父类 _capture_one_stream:1159
+      → torch_compile_decoration.patch_model(...)
+      → 返回原model.forward，或npugraph_ex编译后的forward
+```
+
+作用：enable_compile时使用`torch.compile(torch.no_grad()(model.forward), fullgraph=True, dynamic=False, backend=npugraph_ex)`；未开启则直接返回model.forward。签名中的num_tokens、tp_group当前函数体未使用，不能据此声称实现了shape或通信特化。
+
+重构后放置于`NPUGraphBackend.capture_forward_context(...)`，由公共捕获循环显式调用并获取callable。删除模块级函数替换，避免NPU Runner创建后改变同进程其他Runner的编译行为。
+
+### 2.3 `execute()` 内部分支的具体归属
+
+execute包含多种职责，下面明确每部分迁到哪里，防止新Backend再复制整套Runner。
+
+| 当前分支 / 行号 | 作用及当前调用 | 重构后位置 |
+|---|---|---|
+| `needs_forward_metadata_init()` / 243–244 | 未准备时调用公共load_batch | 公共Runner.execute/load_batch，按Backend返回的准备策略执行 |
+| 非DFlash预规划 / 246–263 | 不重做metadata、不读CPU长度；补刷input_ids、positions及按条件mRoPE | Backend.prepare_replay返回PREPLANNED_REFRESH与字段需求，公共slot刷新执行；保持DSA/V4路径不新增同步 |
+| DFlash预规划特例 / 264–368 | 重新确认B/raw token数，恢复DeepEP模式、DP token数，刷新embedding、mRoPE、长度、req indices、KV写入位置并重新准备metadata | Backend.prepare_replay返回FORCE_REFRESH；公共bucket/registry/build_replay_fb_view执行输入准备；Attention backend执行metadata初始化 |
+| `graph_key = _make_graph_key(self.bs)` / 370 | 旧实现按B重建key | 删除；公共Runner生成完整key并传入GraphReplayContext，Backend直接使用 |
+| DSA/V4判定与长度准备 / 372–404 | 决定直接replay或Host update；verify处理DFlash长度与验证宽度 | NPUGraphBackend的HostInputUpdatePolicy，读取准备完成后的本轮context/metadata |
+| `replay_with_input_update` / 405–410 | 传长度、属性名和类型给NPU后端 | 收敛到NPUGraphBackend.replay内部；公共Runner只调用统一replay入口 |
+| 直接`backend.replay` / 411–412 | DSA/V4不做此Host重绑定 | NPUGraphBackend.replay的NONE更新策略，不能跳过上游设备数据刷新 |
+| logits/full_logits/hidden裁剪 / 414以后 | 使用raw_num_token整理输出，但旧实现重新构造输出对象 | 公共Runner输出整理，保留dataclasses.replace和扩展字段 |
+| PP输出裁剪 / 方法末尾 | 旧实现按bs裁剪 | 公共Runner的token宽度协议；与旧行为差异作为明确修正验收，不静默忽略 |
+
+### 2.4 删除与迁移的判定规则
+
+- 有实际公共调用且属于设备差异：增加Backend接口或能力，由统一Runner委托。
+- 有实际调用但属于公共调度/数据管理：复用统一Runner，不下沉整个实现。
+- 无当前生产调用且已由Backend覆盖：删除重复方法，不为保留旧方法名新增接口。
+- 测试中直接调用旧类私有方法：改为验证新Backend策略或公共Runner组合行为；不能为了旧测试继续保留空壳NPUGraphRunner。
+- 字段与调用点一起迁移，特别是if_use_v2/use_fias_v2_bsnd、attr_name/type；当前未被有效路径使用的use_fia/update_attr_name/update_attr_type应先审计再删除，不机械复制到新Backend。
+
 ## 3. 职责划分
 
 | 职责 | 统一 Runner | NPUGraphBackend | Attention backend |

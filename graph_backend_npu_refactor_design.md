@@ -54,17 +54,25 @@ Runner 负责公共阶段调度、bucket/key、静态输入管理、同步事件
 
 #### 现状
 
-```text
-NPU：
-  Target Verify → NPUGraphRunner                → NPUCudaGraphBackend
-  Draft Decode  → EAGLEDraftNpuGraphRunner      → NPUCudaGraphBackend
-  Draft Extend  → EAGLEDraftExtendNpuGraphRunner → NPUCudaGraphBackend
-
-GPU：
-  Target Verify → DecodeCudaGraphRunner             → FullCudaGraphBackend
-  Draft Decode  → EAGLEDraftCudaGraphRunner          → FullCudaGraphBackend
-  Draft Extend  → EAGLEDraftExtendCudaGraphRunner    → FullCudaGraphBackend
+```mermaid
+flowchart LR
+    A[Target Verify] -->|GPU| D[DecodeCudaGraphRunner]
+    A -->|NPU| N[NPUGraphRunner]
+    B[Draft Decode] -->|GPU| E[EAGLEDraftCudaGraphRunner]
+    B -->|NPU| O[EAGLEDraftNpuGraphRunner]
+    C[Draft Extend] -->|GPU| F[EAGLEDraftExtendCudaGraphRunner]
+    C -->|NPU| P[EAGLEDraftExtendNpuGraphRunner]
+    D --> G[resolve_decode_backend]
+    E --> G
+    F --> G
+    N --> G
+    O --> G
+    P --> G
+    G --> H[GPU: FullCudaGraphBackend]
+    G --> I[NPU: NPUCudaGraphBackend]
 ```
+
+现状已共用 Backend 选择函数，但仍按设备创建不同 Runner；NPU 的长度更新、dtype 等定制分布在这些子类中。图示表达类型与调用关系，不表示所有阶段共享同一个 Backend 实例。
 
 #### 重构后
 

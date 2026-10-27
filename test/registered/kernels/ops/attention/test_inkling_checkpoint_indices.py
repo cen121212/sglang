@@ -752,7 +752,6 @@ class TestInklingCheckpointIndices(CustomTestCase):
                 "require_attn_tp_gather": False,
                 "resolve_decode_backend": SimpleNamespace(
                     cache_loc_dtype=torch.int64,
-                    bind_decode_runner=lambda runner: None,
                 ),
             }
             for name, result in replacements.items():

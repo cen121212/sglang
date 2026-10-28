@@ -479,6 +479,14 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                     cpu_update_input = self._eagle_draft_extend_update_lengths(
                         runner, static_forward_batch
                     )
+                    logger.info(
+                        "NPU Draft Extend graph replay: shape_key=%s, raw_bs=%d, "
+                        "padded_bs=%d, input_update=%s",
+                        shape_key,
+                        runner.raw_bs,
+                        runner.bs,
+                        cpu_update_input,
+                    )
                     return self.replay_with_input_update(
                         shape_key, seq_lens=None, cpu_update_input=cpu_update_input
                     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -57,6 +58,9 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_draft_extend_seq_len_fill_value(
@@ -166,6 +170,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             set_torch_compile_config()
 
         self.backend = resolve_decode_backend(self)
+        if str(getattr(self, "device", "")).startswith("npu"):
+            logger.info(
+                "NPU Draft Extend runner selected backend: %s",
+                type(self.backend).__name__,
+            )
 
         with torch.device(model_runner.device):
             input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
@@ -307,11 +316,20 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
     def _replay_graph(self, shape_key, forward_batch):
+        if str(getattr(self, "device", "")).startswith("npu"):
+            logger.info(
+                "NPU Draft Extend runner replay: shape_key=%s, backend=%s",
+                shape_key,
+                type(self.backend).__name__,
+            )
         with self.model_context():
             return self.backend.replay(shape_key, forward_batch)
 
     def _cache_loc_dtype(self):
-        return self.backend.cache_loc_dtype
+        dtype = self.backend.cache_loc_dtype
+        if str(getattr(self, "device", "")).startswith("npu"):
+            logger.info("NPU Draft Extend runner cache_loc_dtype: %s", dtype)
+        return dtype
 
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)

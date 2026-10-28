@@ -510,7 +510,16 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
             runner.bs - runner.raw_bs
         )
-        return [{self.get_update_attr_name(): seq_lens}]
+        attr_name = self.get_update_attr_name()
+        logger.info(
+            "NPU Draft Extend host length update: raw_bs=%d, padded_bs=%d, "
+            "attr_name=%s, seq_lens=%s",
+            runner.raw_bs,
+            runner.bs,
+            attr_name,
+            seq_lens,
+        )
+        return [{attr_name: seq_lens}]
 
     def _build_eagle_draft_update_payload(self, forward_batch):
         runner = self._decode_runner

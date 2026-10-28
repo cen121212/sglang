@@ -577,6 +577,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"num_tokens_per_req={self.speculative_num_draft_tokens}, "
                 f"bs={capture_bs}, avail mem={before_mem:.2f} GB",
             )
+            if _is_npu:
+                log_info_on_rank0(
+                    logger,
+                    "NPU Draft Extend selecting runner: "
+                    f"{Device2ExtendCudaGraphRunner[self.target_worker.device].__name__}",
+                )
             self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
                 self.target_worker.device
             ](self)

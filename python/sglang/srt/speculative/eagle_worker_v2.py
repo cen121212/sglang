@@ -600,6 +600,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"mem usage={(before_mem - after_mem):.2f} GB, "
                 f"avail mem={after_mem:.2f} GB.",
             )
+            if _is_npu:
+                graph_runner = self.cuda_graph_runner_for_draft_extend
+                log_info_on_rank0(
+                    logger,
+                    "NPU Draft Extend graph is ready. "
+                    f"runner={type(graph_runner).__name__}, "
+                    f"backend={type(graph_runner.backend).__name__}, "
+                    f"input_update_attr={graph_runner.backend.get_update_attr_name()}, "
+                    f"captured_batch_sizes={graph_runner.capture_bs}.",
+                )
 
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info

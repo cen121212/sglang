@@ -11,9 +11,6 @@ from sglang.kernels.ops.speculative.topk1 import (
 )
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
-    EAGLEDraftNpuGraphRunner,
-)
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
@@ -495,7 +492,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         Device2DraftCudaGraphRunner = {
             "xpu": EAGLEDraftCudaGraphRunner,
-            "npu": EAGLEDraftNpuGraphRunner,
+            "npu": EAGLEDraftCudaGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }

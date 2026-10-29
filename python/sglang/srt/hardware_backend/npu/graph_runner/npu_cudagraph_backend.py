@@ -121,8 +121,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         if isinstance(self._decode_runner, DecodeCudaGraphRunner):
             return self._decode_update_attr_name()
         raise TypeError(
-            "Unsupported NPU graph update runner: "
-            f"{type(self._decode_runner).__name__}"
+            f"Unsupported NPU graph update runner: {type(self._decode_runner).__name__}"
         )
 
     def _decode_update_attr_name(self):
@@ -443,8 +442,35 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     ) -> Any:
         runner = self._decode_runner
         if runner is not None:
+            from sglang.srt.speculative import (
+                multi_layer_eagle_draft_extend_cuda_graph_runner as multi_layer,
+            )
+
+            is_multi_layer_draft_extend = isinstance(
+                runner, multi_layer.MultiLayerEagleDraftExtendCudaGraphRunner
+            )
+            if (
+                is_multi_layer_draft_extend
+                and static_forward_batch.seq_lens_cpu is None
+            ):
+                # The shared runner propagates a missing live mirror as None.
+                # Its device buffer may include stale rows beyond this bucket.
+                raise ValueError(
+                    "Multi-layer draft-extend NPU graph replay requires current "
+                    "CPU sequence lengths."
+                )
             hf_config = runner.model_runner.model_config.hf_config
-            if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
+            # The old multi-layer runner always updated Host lengths. Preserve
+            # that contract independently of the generic DSA/V4 opt-out.
+            if is_multi_layer_draft_extend or not (
+                is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
+            ):
+                # The EAGLE draft check must precede the decode fallback:
+                # EAGLEDraftCudaGraphRunner also subclasses
+                # DecodeCudaGraphRunner.
+                from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+                    EAGLEDraftCudaGraphRunner,
+                )
                 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
                     EAGLEDraftExtendCudaGraphRunner,
                 )
@@ -452,6 +478,13 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 if isinstance(runner, EAGLEDraftExtendCudaGraphRunner):
                     cpu_update_input = self._eagle_draft_extend_update_lengths(
                         runner, static_forward_batch
+                    )
+                    return self.replay_with_input_update(
+                        shape_key, seq_lens=None, cpu_update_input=cpu_update_input
+                    )
+                if isinstance(runner, EAGLEDraftCudaGraphRunner):
+                    cpu_update_input = self._build_eagle_draft_update_payload(
+                        static_forward_batch
                     )
                     return self.replay_with_input_update(
                         shape_key, seq_lens=None, cpu_update_input=cpu_update_input
@@ -470,6 +503,20 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             runner.bs - runner.raw_bs
         )
         return [{self.get_update_attr_name(): seq_lens}]
+
+    def _build_eagle_draft_update_payload(self, forward_batch):
+        runner = self._decode_runner
+        # One {attr_name: seq_lens} dict per speculative draft step: the
+        # kth draft forward reads KV lengths seq_len + 1 + k (one draft token
+        # is written to KV per step); padding rows carry 0 so attention
+        # skips them.
+        attr_name = self.get_update_attr_name()
+        cpu_update_input = []
+        for step in range(runner.speculative_num_steps - 1):
+            seq_lens_cpu = forward_batch.seq_lens_cpu[: runner.raw_bs] + step + 1
+            seq_lens = seq_lens_cpu.tolist() + [0] * (runner.bs - runner.raw_bs)
+            cpu_update_input.append({attr_name: seq_lens})
+        return cpu_update_input
 
     def replay_with_input_update(
         self,
